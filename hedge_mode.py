@@ -27,6 +27,9 @@ from decimal import Decimal
 from pathlib import Path
 import dotenv
 
+from trade_prepare import proxy_on
+
+
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -98,6 +101,8 @@ def get_hedge_bot_class(exchange):
 
 async def main():
     """Main entry point that creates and runs the appropriate hedge bot."""
+    # add proxy settings
+    proxy_on()
     args = parse_arguments()
 
     env_path = Path(args.env_file)
