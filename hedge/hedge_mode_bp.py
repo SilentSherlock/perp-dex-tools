@@ -159,7 +159,7 @@ class HedgeBot:
             try:
                 # Note: disconnect() is async, but shutdown() is sync
                 # We'll let the cleanup happen naturally
-                self.backpack_client.ws_disconnect()
+                self.backpack_client.disconnect()
                 self.logger.info("🔌 Backpack WebSocket will be disconnected")
             except Exception as e:
                 self.logger.error(f"Error disconnecting Backpack WebSocket: {e}")
