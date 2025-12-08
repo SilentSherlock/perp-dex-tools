@@ -21,6 +21,7 @@ from exchanges.backpack import BackpackClient
 import websockets
 from datetime import datetime
 import pytz
+import aiohttp
 
 class Config:
     """Simple config class to wrap dictionary for Backpack client."""
@@ -158,6 +159,7 @@ class HedgeBot:
             try:
                 # Note: disconnect() is async, but shutdown() is sync
                 # We'll let the cleanup happen naturally
+                self.backpack_client.ws_disconnect()
                 self.logger.info("🔌 Backpack WebSocket will be disconnected")
             except Exception as e:
                 self.logger.error(f"Error disconnecting Backpack WebSocket: {e}")
@@ -338,7 +340,7 @@ class HedgeBot:
 
     async def request_fresh_snapshot(self, ws):
         """Request fresh order book snapshot."""
-        await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
+        await ws.send_str(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
 
     async def handle_lighter_ws(self):
         """Handle Lighter WebSocket connection and messages."""
@@ -351,9 +353,9 @@ class HedgeBot:
                 # Reset order book state before connecting
                 await self.reset_lighter_order_book()
 
-                async with websockets.connect(url) as ws:
+                async with aiohttp.ClientSession().ws_connect(url, proxy=os.getenv('HTTP_PROXY')) as ws:
                     # Subscribe to order book updates
-                    await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
+                    await ws.send_str(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
 
                     # Subscribe to account orders updates
                     account_orders_channel = f"account_orders/{self.lighter_market_index}/{self.account_index}"
@@ -371,17 +373,17 @@ class HedgeBot:
                                 "channel": account_orders_channel,
                                 "auth": auth_token
                             }
-                            await ws.send(json.dumps(auth_message))
+                            await ws.send_str(json.dumps(auth_message))
                             self.logger.info("✅ Subscribed to account orders with auth token (expires in 10 minutes)")
                     except Exception as e:
                         self.logger.warning(f"⚠️ Error creating auth token for account orders subscription: {e}")
 
                     while not self.stop_flag:
                         try:
-                            msg = await asyncio.wait_for(ws.recv(), timeout=1)
+                            msg = await asyncio.wait_for(ws.receive(), timeout=1)
 
                             try:
-                                data = json.loads(msg)
+                                data = json.loads(msg.data)
                             except json.JSONDecodeError as e:
                                 self.logger.warning(f"⚠️ JSON parsing error in Lighter websocket: {e}")
                                 continue
@@ -452,7 +454,7 @@ class HedgeBot:
 
                                 elif data.get("type") == "ping":
                                     # Respond to ping with pong
-                                    await ws.send(json.dumps({"type": "pong"}))
+                                    await ws.send_str(json.dumps({"type": "pong"}))
                                 elif data.get("type") == "update/account_orders":
                                     # Handle account orders updates
                                     orders = data.get("orders", {}).get(str(self.lighter_market_index), [])
@@ -940,7 +942,7 @@ class HedgeBot:
     async def setup_backpack_depth_websocket(self):
         """Setup separate WebSocket connection for Backpack depth updates."""
         try:
-            import websockets
+            import aiohttp
 
             async def handle_depth_websocket():
                 """Handle depth WebSocket connection."""
@@ -948,13 +950,14 @@ class HedgeBot:
 
                 while not self.stop_flag:
                     try:
-                        async with websockets.connect(url) as ws:
+                        async with aiohttp.ClientSession().ws_connect(url,
+                                                                      proxy=os.getenv('HTTP_PROXY')) as ws:
                             # Subscribe to depth updates
                             subscribe_message = {
                                 "method": "SUBSCRIBE",
                                 "params": [f"depth.{self.backpack_contract_id}"]
                             }
-                            await ws.send(json.dumps(subscribe_message))
+                            await ws.send_str(json.dumps(subscribe_message))
                             self.logger.info(f"✅ Subscribed to depth updates for {self.backpack_contract_id}")
 
                             # Listen for messages
@@ -968,7 +971,7 @@ class HedgeBot:
                                         await ws.pong()
                                         continue
 
-                                    data = json.loads(message)
+                                    data = json.loads(message.data)
 
                                     # Handle depth updates
                                     if data.get('stream') and 'depth' in data.get('stream', ''):

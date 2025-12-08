@@ -12,6 +12,7 @@ from decimal import Decimal
 from typing import Dict, Any, List, Optional, Tuple
 from cryptography.hazmat.primitives.asymmetric import ed25519
 import websockets
+import aiohttp
 from bpx.public import Public
 from .bp_client import Account
 from bpx.constants.enums import OrderTypeEnum, TimeInForceEnum
@@ -54,7 +55,9 @@ class BackpackWebSocketManager:
         while True:
             try:
                 self.logger.log("Connecting to Backpack WebSocket", "INFO")
-                self.websocket = await websockets.connect(self.ws_url)
+                # self.websocket = await websockets.connect(self.ws_url)
+                self.websocket = await aiohttp.ClientSession().ws_connect(self.ws_url,
+                                                                          proxy=os.getenv('HTTP_PROXY'))
                 self.running = True
 
                 # Subscribe to order updates for the specific symbol
@@ -72,7 +75,7 @@ class BackpackWebSocketManager:
                     ]
                 }
 
-                await self.websocket.send(json.dumps(subscribe_message))
+                await self.websocket.send_str(json.dumps(subscribe_message))
                 if self.logger:
                     self.logger.log(f"Subscribed to order updates for {self.symbol}", "INFO")
 
@@ -91,7 +94,7 @@ class BackpackWebSocketManager:
                     break
 
                 try:
-                    data = json.loads(message)
+                    data = json.loads(message.data)
                     await self._handle_message(data)
                 except json.JSONDecodeError as e:
                     if self.logger:
