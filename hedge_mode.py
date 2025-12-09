@@ -102,7 +102,7 @@ def get_hedge_bot_class(exchange):
 async def main():
     """Main entry point that creates and runs the appropriate hedge bot."""
     # add proxy settings
-    # proxy_on()
+    proxy_on()
     args = parse_arguments()
 
     env_path = Path(args.env_file)
