@@ -5,6 +5,8 @@ import logging
 import os
 import sys
 import time
+
+import aiohttp
 import requests
 import argparse
 import traceback
@@ -349,7 +351,7 @@ class HedgeBot:
 
     async def request_fresh_snapshot(self, ws):
         """Request fresh order book snapshot."""
-        await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
+        await ws.send_str(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
 
     async def handle_lighter_ws(self):
         """Handle Lighter WebSocket connection and messages."""
@@ -362,9 +364,9 @@ class HedgeBot:
                 # Reset order book state before connecting
                 await self.reset_lighter_order_book()
 
-                async with websockets.connect(url) as ws:
+                async with aiohttp.ClientSession().ws_connect(url) as ws:
                     # Subscribe to order book updates
-                    await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
+                    await ws.send_str(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
 
                     # Subscribe to account orders updates
                     account_orders_channel = f"account_orders/{self.lighter_market_index}/{self.account_index}"
@@ -382,17 +384,17 @@ class HedgeBot:
                                 "channel": account_orders_channel,
                                 "auth": auth_token
                             }
-                            await ws.send(json.dumps(auth_message))
+                            await ws.send_str(json.dumps(auth_message))
                             self.logger.info("✅ Subscribed to account orders with auth token (expires in 10 minutes)")
                     except Exception as e:
                         self.logger.warning(f"⚠️ Error creating auth token for account orders subscription: {e}")
 
                     while not self.stop_flag:
                         try:
-                            msg = await asyncio.wait_for(ws.recv(), timeout=1)
+                            msg = await asyncio.wait_for(ws.receive(), timeout=1)
 
                             try:
-                                data = json.loads(msg)
+                                data = json.loads(msg.data)
                             except json.JSONDecodeError as e:
                                 self.logger.warning(f"⚠️ JSON parsing error in Lighter websocket: {e}")
                                 continue
@@ -463,7 +465,7 @@ class HedgeBot:
 
                                 elif data.get("type") == "ping":
                                     # Respond to ping with pong
-                                    await ws.send(json.dumps({"type": "pong"}))
+                                    await ws.send_str(json.dumps({"type": "pong"}))
                                 elif data.get("type") == "update/account_orders":
                                     # Handle account orders updates
                                     orders = data.get("orders", {}).get(str(self.lighter_market_index), [])
