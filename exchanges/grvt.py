@@ -319,8 +319,8 @@ class GrvtClient(BaseExchangeClient):
 
             # Get current market prices
             self.logger.log(f"[OPEN] Fetching BBO prices for {contract_id}", "DEBUG")
-            best_bid, best_ask = (1, 2)
-            # best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
+            # best_bid, best_ask = (1, 2)
+            best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
 
             if best_bid <= 0 or best_ask <= 0:
                 return OrderResult(success=False, error_message='Invalid bid/ask prices')

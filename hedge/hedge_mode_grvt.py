@@ -646,13 +646,14 @@ class HedgeBot:
                 self.logger.exception(f"DEBUG-INSPECT: calling place_open_order synchronously raised: {e}")
 
             self.logger.info("DEBUG: Calling place_open_order...")
-            order_result = await asyncio.wait_for(
-                self.grvt_client.place_open_order(
-                    contract_id=self.grvt_contract_id,
-                    quantity=quantity,
-                    direction=side.lower()
-                ), timeout=8
-            )
+            order_result = {'success': True, 'order_id': 'test_order_id', 'price': Decimal('123.45')}
+            # order_result = await asyncio.wait_for(
+            #     self.grvt_client.place_open_order(
+            #         contract_id=self.grvt_contract_id,
+            #         quantity=quantity,
+            #         direction=side.lower()
+            #     ), timeout=8
+            # )
         except asyncio.TimeoutError:
             self.logger.error("DEBUG: place_open_order timed out (blocked).")
             raise
