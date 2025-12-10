@@ -624,6 +624,7 @@ class HedgeBot:
     async def place_bbo_order(self, side: str, quantity: Decimal):
         # Place the order using GRVT client
         self.logger.info(f"Placing GRVT {side.upper()} order for {quantity} at BBO")
+        self.logger.info(f"check grvt_client is None:{self.grvt_client is None}")
         order_result = await self.grvt_client.place_open_order(
             contract_id=self.grvt_contract_id,
             quantity=quantity,
