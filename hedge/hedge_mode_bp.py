@@ -149,7 +149,7 @@ class HedgeBot:
         self.backpack_public_key = os.getenv('BACKPACK_PUBLIC_KEY')
         self.backpack_secret_key = os.getenv('BACKPACK_SECRET_KEY')
 
-    def shutdown(self, signum=None, frame=None):
+    async def shutdown(self, signum=None, frame=None):
         """Graceful shutdown handler."""
         self.stop_flag = True
         self.logger.info("\n🛑 Stopping...")
@@ -159,7 +159,7 @@ class HedgeBot:
             try:
                 # Note: disconnect() is async, but shutdown() is sync
                 # We'll let the cleanup happen naturally
-                self.backpack_client.disconnect()
+                await self.backpack_client.disconnect()
                 self.logger.info("🔌 Backpack WebSocket will be disconnected")
             except Exception as e:
                 self.logger.error(f"Error disconnecting Backpack WebSocket: {e}")
@@ -1214,4 +1214,4 @@ class HedgeBot:
             self.logger.info("\n🛑 Received interrupt signal...")
         finally:
             self.logger.info("🔄 Cleaning up...")
-            self.shutdown()
+            await self.shutdown()
