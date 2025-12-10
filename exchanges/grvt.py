@@ -234,8 +234,10 @@ class GrvtClient(BaseExchangeClient):
     @query_retry(reraise=True)
     async def fetch_bbo_prices(self, contract_id: str) -> Tuple[Decimal, Decimal]:
         """Fetch best bid and offer prices for a contract."""
+        self.logger.log(f"Fetching BBO prices for {contract_id}", "DEBUG")
         # Get order book from GRVT
         order_book = self.rest_client.fetch_order_book(contract_id, limit=10)
+        self.logger.log(f"Order book data: {order_book}", "DEBUG")
 
         if not order_book or 'bids' not in order_book or 'asks' not in order_book:
             raise ValueError(f"Unable to get order book: {order_book}")
@@ -300,6 +302,7 @@ class GrvtClient(BaseExchangeClient):
 
     async def place_open_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
         """Place an open order with GRVT."""
+        self.logger.log(f"[OPEN] Starting to place {direction} order for {quantity} of {contract_id}", "INFO")
         attempt = 0
         while True:
             attempt += 1
