@@ -627,11 +627,23 @@ class HedgeBot:
         self.logger.info(f"check grvt_client is None:{self.grvt_client is None}")
         # self.logger.info(f"Grvt loop:", self.grvt_client.loop)
         # self.logger.info(f"Current loop:", asyncio.get_running_loop())
-        order_result = await self.grvt_client.place_open_order(
-            contract_id=self.grvt_contract_id,
-            quantity=quantity,
-            direction=side.lower()
-        )
+        try:
+            order_result = await asyncio.wait_for(
+                self.grvt_client.place_open_order(
+                    contract_id=self.grvt_contract_id,
+                    quantity=quantity,
+                    direction=side.lower()
+                ), timeout=8
+            )
+        except asyncio.TimeoutError:
+            self.logger.error("DEBUG: place_open_order timed out (blocked).")
+            raise
+
+        # order_result = self.grvt_client.place_open_order(
+        #     contract_id=self.grvt_contract_id,
+        #     quantity=quantity,
+        #     direction=side.lower()
+        # )
         self.logger.info(f"Order result: {order_result}")
 
         if order_result.success:
