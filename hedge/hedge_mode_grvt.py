@@ -364,7 +364,7 @@ class HedgeBot:
                 # Reset order book state before connecting
                 await self.reset_lighter_order_book()
 
-                async with aiohttp.ClientSession().ws_connect(url) as ws:
+                async with aiohttp.ClientSession().ws_connect(url, proxy=os.getenv("HTTP_PROXY")) as ws:
                     # Subscribe to order book updates
                     await ws.send_str(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
 
