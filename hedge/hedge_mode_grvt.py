@@ -627,42 +627,42 @@ class HedgeBot:
         self.logger.info(f"check grvt_client is None:{self.grvt_client is None}")
         # self.logger.info(f"Grvt loop:", self.grvt_client.loop)
         # self.logger.info(f"Current loop:", asyncio.get_running_loop())
-        try:
-            import inspect, asyncio, types
+        # try:
+        #     import inspect, asyncio, types
+        #
+        #     self.logger.info("DEBUG-INSPECT: checking place_open_order properties...")
+        #     fn = self.grvt_client.place_open_order
+        #     self.logger.info(f"DEBUG-INSPECT: place_open_order object repr: {repr(fn)}")
+        #     self.logger.info(f"DEBUG-INSPECT: iscoroutinefunction: {inspect.iscoroutinefunction(fn)}")
+        #     self.logger.info(f"DEBUG-INSPECT: isfunction: {inspect.isfunction(fn)}")
+        #     self.logger.info(f"DEBUG-INSPECT: ismethod: {inspect.ismethod(fn)}")
+        #     #  now call it but DON'T await — inspect the returned value
+        #     try:
+        #         ret = fn(contract_id=self.grvt_contract_id, quantity=Decimal('0.001'), direction='buy')
+        #         self.logger.info(f"DEBUG-INSPECT: returned type: {type(ret)}, repr: {repr(ret)}")
+        #         self.logger.info(f"DEBUG-INSPECT: iscoroutine: {inspect.iscoroutine(ret)}")
+        #         self.logger.info(f"DEBUG-INSPECT: isawaitable: {inspect.isawaitable(ret)}")
+        #     except Exception as e:
+        #         self.logger.exception(f"DEBUG-INSPECT: calling place_open_order synchronously raised: {e}")
+        #
+        #     self.logger.info("DEBUG: Calling place_open_order...")
+        #     # order_result = {'success': True, 'order_id': 'test_order_id', 'price': Decimal('123.45')}
+        #     order_result = await asyncio.wait_for(
+        #         self.grvt_client.place_open_order(
+        #             contract_id=self.grvt_contract_id,
+        #             quantity=quantity,
+        #             direction=side.lower()
+        #         ), timeout=8
+        #     )
+        # except asyncio.TimeoutError:
+        #     self.logger.error("DEBUG: place_open_order timed out (blocked).")
+        #     raise
 
-            self.logger.info("DEBUG-INSPECT: checking place_open_order properties...")
-            fn = self.grvt_client.place_open_order
-            self.logger.info(f"DEBUG-INSPECT: place_open_order object repr: {repr(fn)}")
-            self.logger.info(f"DEBUG-INSPECT: iscoroutinefunction: {inspect.iscoroutinefunction(fn)}")
-            self.logger.info(f"DEBUG-INSPECT: isfunction: {inspect.isfunction(fn)}")
-            self.logger.info(f"DEBUG-INSPECT: ismethod: {inspect.ismethod(fn)}")
-            #  now call it but DON'T await — inspect the returned value
-            try:
-                ret = fn(contract_id=self.grvt_contract_id, quantity=Decimal('0.001'), direction='buy')
-                self.logger.info(f"DEBUG-INSPECT: returned type: {type(ret)}, repr: {repr(ret)}")
-                self.logger.info(f"DEBUG-INSPECT: iscoroutine: {inspect.iscoroutine(ret)}")
-                self.logger.info(f"DEBUG-INSPECT: isawaitable: {inspect.isawaitable(ret)}")
-            except Exception as e:
-                self.logger.exception(f"DEBUG-INSPECT: calling place_open_order synchronously raised: {e}")
-
-            self.logger.info("DEBUG: Calling place_open_order...")
-            order_result = {'success': True, 'order_id': 'test_order_id', 'price': Decimal('123.45')}
-            # order_result = await asyncio.wait_for(
-            #     self.grvt_client.place_open_order(
-            #         contract_id=self.grvt_contract_id,
-            #         quantity=quantity,
-            #         direction=side.lower()
-            #     ), timeout=8
-            # )
-        except asyncio.TimeoutError:
-            self.logger.error("DEBUG: place_open_order timed out (blocked).")
-            raise
-
-        # order_result = self.grvt_client.place_open_order(
-        #     contract_id=self.grvt_contract_id,
-        #     quantity=quantity,
-        #     direction=side.lower()
-        # )
+        order_result = await self.grvt_client.place_open_order(
+            contract_id=self.grvt_contract_id,
+            quantity=quantity,
+            direction=side.lower()
+        )
         self.logger.info(f"Order result: {order_result}")
 
         if order_result.success:
