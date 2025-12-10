@@ -626,7 +626,7 @@ class HedgeBot:
         self.logger.info(f"Placing GRVT {side.upper()} order for {quantity} at BBO")
         self.logger.info(f"check grvt_client is None:{self.grvt_client is None}")
         # self.logger.info(f"Grvt loop:", self.grvt_client.loop)
-        self.logger.info(f"Current loop:", asyncio.get_running_loop())
+        # self.logger.info(f"Current loop:", asyncio.get_running_loop())
         order_result = await self.grvt_client.place_open_order(
             contract_id=self.grvt_contract_id,
             quantity=quantity,
