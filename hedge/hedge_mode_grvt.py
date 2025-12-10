@@ -658,7 +658,7 @@ class HedgeBot:
         #     self.logger.error("DEBUG: place_open_order timed out (blocked).")
         #     raise
 
-        order_result = self.grvt_client.place_open_order(
+        order_result = await self.grvt_client.place_open_order(
             contract_id=self.grvt_contract_id,
             quantity=quantity,
             direction=side.lower()
