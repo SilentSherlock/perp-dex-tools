@@ -632,6 +632,7 @@ class HedgeBot:
             quantity=quantity,
             direction=side.lower()
         )
+        self.logger.info(f"Order result: {order_result}")
 
         if order_result.success:
             return order_result.order_id, order_result.price
