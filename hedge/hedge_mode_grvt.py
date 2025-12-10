@@ -628,6 +628,23 @@ class HedgeBot:
         # self.logger.info(f"Grvt loop:", self.grvt_client.loop)
         # self.logger.info(f"Current loop:", asyncio.get_running_loop())
         try:
+            import inspect, asyncio, types
+
+            self.logger.info("DEBUG-INSPECT: checking place_open_order properties...")
+            fn = self.grvt_client.place_open_order
+            self.logger.info(f"DEBUG-INSPECT: place_open_order object repr: {repr(fn)}")
+            self.logger.info(f"DEBUG-INSPECT: iscoroutinefunction: {inspect.iscoroutinefunction(fn)}")
+            self.logger.info(f"DEBUG-INSPECT: isfunction: {inspect.isfunction(fn)}")
+            self.logger.info(f"DEBUG-INSPECT: ismethod: {inspect.ismethod(fn)}")
+            #  now call it but DON'T await — inspect the returned value
+            try:
+                ret = fn(contract_id=self.grvt_contract_id, quantity=Decimal('0.001'), direction='buy')
+                self.logger.info(f"DEBUG-INSPECT: returned type: {type(ret)}, repr: {repr(ret)}")
+                self.logger.info(f"DEBUG-INSPECT: iscoroutine: {inspect.iscoroutine(ret)}")
+                self.logger.info(f"DEBUG-INSPECT: isawaitable: {inspect.isawaitable(ret)}")
+            except Exception as e:
+                self.logger.exception(f"DEBUG-INSPECT: calling place_open_order synchronously raised: {e}")
+
             self.logger.info("DEBUG: Calling place_open_order...")
             order_result = await asyncio.wait_for(
                 self.grvt_client.place_open_order(
