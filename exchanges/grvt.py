@@ -304,7 +304,7 @@ class GrvtClient(BaseExchangeClient):
         """Place an open order with GRVT."""
         self.logger.log(f"[OPEN] Starting to place {direction} order for {quantity} of {contract_id}", "INFO")
         attempt = 0
-        while True:
+        while attempt < 15:
             attempt += 1
             if attempt % 5 == 0:
                 self.logger.log(f"[OPEN] Attempt {attempt} to place order", "INFO")
@@ -511,7 +511,7 @@ class GrvtClient(BaseExchangeClient):
 
         for position in positions:
             if position.get('instrument') == self.config.contract_id:
-                return abs(Decimal(position.get('size', 0)))
+                return Decimal(position.get('size', 0))
 
         return Decimal(0)
 
