@@ -128,8 +128,14 @@ class PacificaClient(BaseExchangeClient):
         if self.ws_manager:
             await self.ws_manager.disconnect()
 
+    # python
     def _get_headers(self) -> Dict[str, str]:
-        return {"Accept": "*/*"}
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+        return headers
 
     # --- WebSocket callbacks ---
     async def _on_price(self, data):
@@ -151,6 +157,7 @@ class PacificaClient(BaseExchangeClient):
     @query_retry()
     async def get_active_orders(self) -> List[OrderInfo]:
         url = f"{self.base_url}/api/v1/orders?account={self.account}"
+
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=self._get_headers()) as resp:
                 data = await resp.json()
@@ -178,7 +185,7 @@ class PacificaClient(BaseExchangeClient):
             else:
                 price = bbo[0] + Decimal("0.01")
 
-        url = f"{self.base_url}/api/v1/orders/create_limit"
+        url = f"{self.base_url}/api/v1/orders/create"
         payload = {
             "account": self.account,
             "symbol": symbol,
@@ -187,8 +194,10 @@ class PacificaClient(BaseExchangeClient):
             "initial_amount": str(amount),
             "client_order_id": client_order_id
         }
+
+        final_payload = self.signer.sign_operation("create_order", payload)
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=self._get_headers(), json=payload) as resp:
+            async with session.post(url, headers=self._get_headers(), json=final_payload) as resp:
                 data = await resp.json()
         if data.get("success"):
             self.logger.log(f"[LimitOrder] Placed {side} {amount}@{price} with client_order_id={client_order_id}", "INFO")
@@ -204,8 +213,9 @@ class PacificaClient(BaseExchangeClient):
             payload["order_id"] = order_id
         if client_order_id:
             payload["client_order_id"] = client_order_id
+        final_payload = self.signer.sign_operation("cancel_order", payload)
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=self._get_headers(), json=payload) as resp:
+            async with session.post(url, headers=self._get_headers(), json=final_payload) as resp:
                 data = await resp.json()
         if data.get("success"):
             self.logger.log(f"[CancelOrder] Success order_id={order_id or client_order_id}", "INFO")
