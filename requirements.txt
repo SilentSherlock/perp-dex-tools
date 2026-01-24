@@ -36,3 +36,9 @@ base58>=2.1.1
 
 # standx
 pynacl==1.6.2
+
+#opinion
+opinion-clob-sdk
+
+#grvt
+grvt-pysdk
