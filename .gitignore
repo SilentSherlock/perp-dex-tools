@@ -3,6 +3,7 @@
 
 *.csv
 bnbenv
+*.env
 
 # Logs
 logs

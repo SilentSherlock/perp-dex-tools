@@ -10,7 +10,7 @@ import argparse
 import traceback
 import csv
 from decimal import Decimal
-from typing import Tuple
+from typing import Tuple, Optional, Dict, Any, List
 
 from lighter.signer_client import SignerClient
 import sys
@@ -44,6 +44,14 @@ class HedgeBot:
             self.max_position = order_quantity
         else:
             self.max_position = max_position        
+        self.max_lighter_slippage = min(Decimal('0.002'), max(Decimal('0.0001'), self._safe_decimal_env('HEDGE_MAX_LIGHTER_SLIPPAGE', Decimal('0.0012'))))
+        self.base_lighter_slippage = min(self.max_lighter_slippage, self._safe_decimal_env('HEDGE_BASE_LIGHTER_SLIPPAGE', Decimal('0.0004')))
+        self.max_basis_bps = max(Decimal('1'), self._safe_decimal_env('HEDGE_MAX_BASIS_BPS', Decimal('15')))
+        self.basis_wait_timeout = float(self._safe_decimal_env('HEDGE_BASIS_WAIT_TIMEOUT_SEC', Decimal('3')))
+        self.soft_exposure_limit = self.order_quantity * max(Decimal('1'), self._safe_decimal_env('HEDGE_SOFT_EXPOSURE_MULTIPLIER', Decimal('1.5')))
+        self.hard_exposure_limit = self.order_quantity * max(Decimal('1'), self._safe_decimal_env('HEDGE_HARD_EXPOSURE_MULTIPLIER', Decimal('2')))
+        if self.soft_exposure_limit > self.hard_exposure_limit:
+            self.soft_exposure_limit = self.hard_exposure_limit
 
         # Initialize logging to file
         os.makedirs("logs", exist_ok=True)
@@ -129,6 +137,7 @@ class HedgeBot:
         # Strategy state
         self.waiting_for_lighter_fill = False
         self.wait_start_time = None
+        self.circuit_breaker_triggered = False
 
         # Order execution tracking
         self.order_execution_complete = False
@@ -138,6 +147,8 @@ class HedgeBot:
         self.current_lighter_quantity = None
         self.current_lighter_price = None
         self.lighter_order_info = None
+        self.pending_lighter_hedges: List[Dict[str, Any]] = []
+        self.backpack_order_hedged_size: Dict[str, Decimal] = {}
 
         # Lighter API configuration
         self.lighter_base_url = "https://mainnet.zklighter.elliot.ai"
@@ -147,6 +158,27 @@ class HedgeBot:
         # Backpack configuration
         self.backpack_public_key = os.getenv('BACKPACK_PUBLIC_KEY')
         self.backpack_secret_key = os.getenv('BACKPACK_SECRET_KEY')
+
+    def _safe_decimal_env(self, key: str, default: Decimal) -> Decimal:
+        raw = os.getenv(key)
+        if raw is None or raw == "":
+            return default
+        try:
+            return Decimal(raw)
+        except Exception:
+            if hasattr(self, "logger") and self.logger:
+                self.logger.warning(f"Invalid decimal env {key}={raw}, fallback to {default}")
+            else:
+                print(f"Warning: invalid decimal env {key}={raw}, fallback to {default}")
+            return default
+
+    def trigger_circuit_breaker(self, reason: str):
+        """Trigger a controlled stop when critical hedging risk is detected."""
+        if self.circuit_breaker_triggered:
+            return
+        self.circuit_breaker_triggered = True
+        self.stop_flag = True
+        self.logger.error(f"🚨 Circuit breaker triggered: {reason}")
 
     def shutdown(self, signum=None, frame=None):
         """Graceful shutdown handler."""
@@ -428,6 +460,7 @@ class HedgeBot:
                                     # Validate offset sequence
                                     if not self.validate_order_book_offset(new_offset):
                                         self.lighter_order_book_sequence_gap = True
+                                        self.lighter_order_book_ready = False
                                         break
 
                                     # Update the order book with new data
@@ -436,6 +469,7 @@ class HedgeBot:
 
                                     # Validate order book integrity after update
                                     if not self.validate_order_book_integrity():
+                                        self.lighter_order_book_ready = False
                                         self.logger.warning("🔄 Order book integrity check failed, requesting fresh snapshot...")
                                         break
 
@@ -618,9 +652,135 @@ class HedgeBot:
             return price
         return (price / self.backpack_tick_size).quantize(Decimal('1')) * self.backpack_tick_size
 
+    def compute_lighter_slippage(self, best_bid: Decimal, best_ask: Decimal) -> Decimal:
+        """Compute dynamic slippage ratio capped by configured maximum."""
+        if best_bid <= 0 or best_ask <= 0:
+            return self.base_lighter_slippage
+        mid = (best_bid + best_ask) / Decimal('2')
+        spread_ratio = (best_ask - best_bid) / mid if mid > 0 else Decimal('0')
+        dynamic_slippage = self.base_lighter_slippage + (spread_ratio * Decimal('2'))
+        return min(self.max_lighter_slippage, max(self.base_lighter_slippage, dynamic_slippage))
+
+    def compute_lighter_aggressive_price(self, lighter_side: str, best_bid: Decimal, best_ask: Decimal) -> Decimal:
+        """Get aggressive but capped price for Lighter hedge leg."""
+        slippage_ratio = self.compute_lighter_slippage(best_bid, best_ask)
+        if lighter_side.lower() == 'buy':
+            raw_price = best_ask * (Decimal('1') + slippage_ratio)
+        else:
+            raw_price = best_bid * (Decimal('1') - slippage_ratio)
+        return (raw_price / self.tick_size).quantize(Decimal('1')) * self.tick_size
+
+    def normalize_lighter_order_params(self, quantity: Decimal, price: Decimal) -> Tuple[Decimal, Decimal, int, int]:
+        """Normalize quantity/price to Lighter precision and return integer payload values."""
+        base_amount = int((quantity * self.base_amount_multiplier).to_integral_value())
+        if base_amount <= 0:
+            raise ValueError(f"Lighter normalized base_amount is zero: quantity={quantity}")
+        normalized_quantity = Decimal(base_amount) / Decimal(self.base_amount_multiplier)
+        normalized_price = (price / self.tick_size).quantize(Decimal('1')) * self.tick_size
+        price_int = int((normalized_price * self.price_multiplier).to_integral_value())
+        if price_int <= 0:
+            raise ValueError(f"Lighter normalized price is zero: price={price}")
+        return normalized_quantity, normalized_price, base_amount, price_int
+
+    def calculate_basis_bps(self, reference_price: Decimal, hedge_price: Decimal) -> Decimal:
+        if reference_price <= 0:
+            return Decimal('0')
+        return abs(hedge_price - reference_price) / reference_price * Decimal('10000')
+
+    async def wait_for_acceptable_basis(self, reference_price: Decimal, lighter_side: str) -> bool:
+        """Wait briefly for cross-exchange basis to return under threshold."""
+        start_time = time.time()
+        while not self.stop_flag:
+            best_bid, best_ask = self.get_lighter_best_levels()
+            if best_bid and best_ask:
+                hedge_reference = best_ask[0] if lighter_side.lower() == 'buy' else best_bid[0]
+                basis_bps = self.calculate_basis_bps(reference_price, hedge_reference)
+                if basis_bps <= self.max_basis_bps:
+                    return True
+            if time.time() - start_time >= self.basis_wait_timeout:
+                return False
+            await asyncio.sleep(0.1)
+        return False
+
+    def is_market_data_healthy(self) -> bool:
+        if not self.backpack_order_book_ready or not self.lighter_order_book_ready:
+            return False
+        if self.lighter_order_book_sequence_gap:
+            return False
+        if self.backpack_best_bid is None or self.backpack_best_ask is None:
+            return False
+        if self.lighter_best_bid is None or self.lighter_best_ask is None:
+            return False
+        return True
+
+    async def wait_for_market_data_health(self, timeout: int = 10) -> bool:
+        start = time.time()
+        while not self.stop_flag:
+            if self.is_market_data_healthy():
+                return True
+            if time.time() - start > timeout:
+                self.logger.warning("⚠️ Market data not healthy within timeout, skip this cycle")
+                return False
+            await asyncio.sleep(0.5)
+        return False
+
+    def get_dynamic_requote_timeout(self) -> float:
+        """Adaptive timeout for maker order cancel/requote."""
+        if self.backpack_best_bid and self.backpack_best_ask and self.backpack_best_ask > self.backpack_best_bid:
+            mid = (self.backpack_best_bid + self.backpack_best_ask) / Decimal('2')
+            spread_ratio = (self.backpack_best_ask - self.backpack_best_bid) / mid if mid > 0 else Decimal('0')
+            if spread_ratio <= Decimal('0.0002'):
+                return 6.0
+            if spread_ratio >= Decimal('0.0010'):
+                return 12.0
+        return 9.0
+
+    async def should_requote_backpack_order(self, side: str, order_price: Optional[Decimal], start_time: float) -> bool:
+        if order_price is None:
+            return time.time() - start_time > self.get_dynamic_requote_timeout()
+        if time.time() - start_time > self.get_dynamic_requote_timeout():
+            return True
+        if self.backpack_best_bid is None or self.backpack_best_ask is None or self.backpack_tick_size is None:
+            return False
+        price_drift_ticks = Decimal('2') * self.backpack_tick_size
+        if side.lower() == 'buy':
+            return (self.backpack_best_ask - order_price) > price_drift_ticks
+        return (order_price - self.backpack_best_bid) > price_drift_ticks
+
+    async def process_pending_lighter_hedges(self):
+        """Execute queued hedge legs in FIFO order."""
+        while self.pending_lighter_hedges and not self.stop_flag:
+            hedge_task = self.pending_lighter_hedges.pop(0)
+            await self.place_lighter_market_order(
+                hedge_task['lighter_side'],
+                hedge_task['quantity'],
+                hedge_task['price']
+            )
+        self.waiting_for_lighter_fill = len(self.pending_lighter_hedges) > 0
+
+    async def check_exposure_limits(self) -> bool:
+        """Apply soft/hard exposure controls."""
+        net_exposure = abs(self.backpack_position + self.lighter_position)
+        if net_exposure > self.hard_exposure_limit:
+            self.trigger_circuit_breaker(
+                f"Hard exposure breached: {net_exposure} > {self.hard_exposure_limit}"
+            )
+            raise RuntimeError("Hard exposure limit breached")
+        if net_exposure > self.soft_exposure_limit:
+            self.logger.warning(
+                f"⚠️ Soft exposure warning: {net_exposure} > {self.soft_exposure_limit}, throttling..."
+            )
+            await asyncio.sleep(1)
+            return False
+        return True
+
     async def place_bbo_order(self, side: str, quantity: Decimal):
         # Get best bid/ask prices
         best_bid, best_ask = await self.fetch_backpack_bbo_prices()
+        if side.lower() == 'buy':
+            order_price = self.round_to_tick(best_ask - self.backpack_tick_size)
+        else:
+            order_price = self.round_to_tick(best_bid + self.backpack_tick_size)
 
         # Place the order using Backpack client
         order_result = await self.backpack_client.place_open_order(
@@ -630,7 +790,7 @@ class HedgeBot:
         )
 
         if order_result.success:
-            return order_result.order_id
+            return order_result.order_id, order_price
         else:
             raise Exception(f"Failed to place order: {order_result.error_message}")
 
@@ -641,18 +801,20 @@ class HedgeBot:
 
         self.backpack_order_status = None
         self.logger.info(f"[OPEN] [Backpack] [{side}] Placing Backpack POST-ONLY order")
-        order_id = await self.place_bbo_order(side, quantity)
+        order_id, order_price = await self.place_bbo_order(side, quantity)
 
         start_time = time.time()
         while not self.stop_flag:
+            if self.pending_lighter_hedges:
+                await self.process_pending_lighter_hedges()
             if self.backpack_order_status == 'CANCELED':
                 self.backpack_order_status = 'NEW'
-                order_id = await self.place_bbo_order(side, quantity)
+                order_id, order_price = await self.place_bbo_order(side, quantity)
                 start_time = time.time()
                 await asyncio.sleep(0.5)
             elif self.backpack_order_status in ['NEW', 'OPEN', 'PENDING', 'CANCELING', 'PARTIALLY_FILLED']:
                 await asyncio.sleep(0.5)
-                if time.time() - start_time > 10:
+                if await self.should_requote_backpack_order(side, order_price, start_time):
                     try:
                         # Cancel the order using Backpack client
                         cancel_result = await self.backpack_client.cancel_order(order_id)
@@ -729,6 +891,8 @@ class HedgeBot:
         side = order_data.get('side', '').lower()
         filled_size = Decimal(order_data.get('filled_size', '0'))
         price = Decimal(order_data.get('price', '0'))
+        if filled_size <= 0:
+            return
 
         if side == 'buy':
             lighter_side = 'sell'
@@ -746,6 +910,7 @@ class HedgeBot:
             'price': price
         }
 
+        self.pending_lighter_hedges.append(self.lighter_order_info.copy())
         self.waiting_for_lighter_fill = True
 
 
@@ -754,23 +919,35 @@ class HedgeBot:
             await self.initialize_lighter_client()
 
         best_bid, best_ask = self.get_lighter_best_levels()
+        if best_bid is None or best_ask is None:
+            self.trigger_circuit_breaker("Lighter best bid/ask unavailable during hedge")
+            raise RuntimeError("Missing Lighter order book for hedge")
 
         # Determine order parameters
         if lighter_side.lower() == 'buy':
             order_type = "CLOSE"
             is_ask = False
-            price = best_ask[0] * Decimal('1.002')
         else:
             order_type = "OPEN"
             is_ask = True
-            price = best_bid[0] * Decimal('0.998')
+        basis_ok = await self.wait_for_acceptable_basis(price, lighter_side)
+        if not basis_ok:
+            self.logger.warning(
+                f"⚠️ Basis still above threshold after {self.basis_wait_timeout}s, proceed to avoid naked exposure"
+            )
+            best_bid, best_ask = self.get_lighter_best_levels()
+            if best_bid is None or best_ask is None:
+                self.trigger_circuit_breaker("Lighter best bid/ask missing after basis wait")
+                raise RuntimeError("Missing Lighter order book after basis wait")
+        price = self.compute_lighter_aggressive_price(lighter_side, best_bid[0], best_ask[0])
+        normalized_quantity, normalized_price, base_amount, price_int = self.normalize_lighter_order_params(quantity, price)
 
 
         # Reset order state
         self.lighter_order_filled = False
-        self.lighter_order_price = price
+        self.lighter_order_price = normalized_price
         self.lighter_order_side = lighter_side
-        self.lighter_order_size = quantity
+        self.lighter_order_size = normalized_quantity
 
         try:
             client_order_index = int(time.time() * 1000)
@@ -778,8 +955,8 @@ class HedgeBot:
             tx, tx_hash, error = await self.lighter_client.create_order(
                 market_index=self.lighter_market_index,
                 client_order_index=client_order_index,
-                base_amount=int(quantity * self.base_amount_multiplier),
-                price=int(price * self.price_multiplier),
+                base_amount=base_amount,
+                price=price_int,
                 is_ask=is_ask,
                 order_type=self.lighter_client.ORDER_TYPE_LIMIT,
                 time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
@@ -789,14 +966,16 @@ class HedgeBot:
             if error is not None:
                 raise Exception(f"Error placing Lighter order: {error}")
 
-            self.logger.info(f"[{client_order_index}] [{order_type}] [Lighter] [OPEN]: {quantity}")
+            slippage_bps = self.compute_lighter_slippage(best_bid[0], best_ask[0]) * Decimal('10000')
+            self.logger.info(f"[{client_order_index}] [{order_type}] [Lighter] [OPEN]: {normalized_quantity} @ {normalized_price} (slippage={slippage_bps:.2f}bps)")
 
             await self.monitor_lighter_order(client_order_index)
 
             return tx_hash
         except Exception as e:
             self.logger.error(f"❌ Error placing Lighter order: {e}")
-            return None
+            self.trigger_circuit_breaker(f"Lighter hedge placement failed: {e}")
+            raise
 
     async def monitor_lighter_order(self, client_order_index: int):
         """Monitor Lighter order and adjust price if needed."""
@@ -808,12 +987,9 @@ class HedgeBot:
                 self.logger.error(f"❌ Timeout waiting for Lighter order fill after {time.time() - start_time:.1f}s")
                 self.logger.error(f"❌ Order state - Filled: {self.lighter_order_filled}")
 
-                # Fallback: Mark as filled to continue trading
-                self.logger.warning("⚠️ Using fallback - marking order as filled to continue trading")
-                self.lighter_order_filled = True
-                self.waiting_for_lighter_fill = False
-                self.order_execution_complete = True
-                break
+                # Hard stop on timeout to avoid fake hedging
+                self.trigger_circuit_breaker(f"Lighter hedge timeout for order {client_order_index}")
+                raise TimeoutError(f"Lighter order timeout: {client_order_index}")
 
             await asyncio.sleep(0.1)  # Check every 100ms
 
@@ -877,23 +1053,20 @@ class HedgeBot:
                 if status == 'CANCELED' and filled_size > 0:
                     status = 'FILLED'
 
-                # Handle the order update
-                if status == 'FILLED' and self.backpack_order_status != 'FILLED':
+                previous_hedged = self.backpack_order_hedged_size.get(order_id, Decimal('0'))
+                delta_filled = filled_size - previous_hedged
+                if delta_filled > 0:
+                    self.backpack_order_hedged_size[order_id] = filled_size
                     if side == 'buy':
-                        self.backpack_position += filled_size
+                        self.backpack_position += delta_filled
                     else:
-                        self.backpack_position -= filled_size
-                    self.logger.info(f"[{order_id}] [{order_type}] [Backpack] [{status}]: {filled_size} @ {price}")
-                    self.backpack_order_status = status
-
-                    # Log Backpack trade to CSV
+                        self.backpack_position -= delta_filled
                     self.log_trade_to_csv(
                         exchange='Backpack',
                         side=side,
                         price=str(price),
-                        quantity=str(filled_size)
+                        quantity=str(delta_filled)
                     )
-
                     self.handle_backpack_order_update({
                         'order_id': order_id,
                         'side': side,
@@ -901,8 +1074,15 @@ class HedgeBot:
                         'size': size,
                         'price': price,
                         'contract_id': self.backpack_contract_id,
-                        'filled_size': filled_size
+                        'filled_size': delta_filled
                     })
+
+                if status in ['FILLED', 'CANCELED', 'EXPIRED']:
+                    self.backpack_order_hedged_size.pop(order_id, None)
+
+                if status == 'FILLED':
+                    self.logger.info(f"[{order_id}] [{order_type}] [Backpack] [{status}]: {filled_size} @ {price}")
+                    self.backpack_order_status = status
                 elif self.backpack_order_status != 'FILLED':
                     if status == 'OPEN':
                         self.logger.info(f"[{order_id}] [{order_type}] [Backpack] [{status}]: {size} @ {price}")
@@ -1108,12 +1288,19 @@ class HedgeBot:
                 self.lighter_position = self.get_lighter_position()
                 self.backpack_position = await self.get_backpack_position()
                 self.logger.info(f"Buying up to {self.max_position} | Backpack position: {self.backpack_position} | Lighter position: {self.lighter_position}")
-                if abs(self.backpack_position + self.lighter_position) > self.order_quantity*2:
+                if not await self.wait_for_market_data_health():
+                    continue
+                if not await self.check_exposure_limits():
+                    continue
+                if abs(self.backpack_position + self.lighter_position) > self.hard_exposure_limit:
                     self.logger.error(f"❌ Position diff is too large: {self.backpack_position + self.lighter_position}")
-                    sys.exit(1)
+                    self.trigger_circuit_breaker(f"Hard exposure breached in buy loop: {self.backpack_position + self.lighter_position}")
+                    raise RuntimeError("Hard exposure breach")
 
                 self.order_execution_complete = False
                 self.waiting_for_lighter_fill = False
+                self.pending_lighter_hedges.clear()
+                start_time = time.time()
                 try:
                     # Determine side based on some logic (for now, alternate)
                     side = 'buy'
@@ -1121,22 +1308,19 @@ class HedgeBot:
                 except Exception as e:
                     self.logger.error(f"⚠️ Error in trading loop: {e}")
                     self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
-                    sys.exit(1)
+                    self.trigger_circuit_breaker(f"Buy loop failed: {e}")
+                    break
 
                 start_time = time.time()
                 while not self.order_execution_complete and not self.stop_flag:
                     # Check if Backpack order filled and we need to place Lighter order
                     if self.waiting_for_lighter_fill:
-                        await self.place_lighter_market_order(
-                            self.current_lighter_side,
-                            self.current_lighter_quantity,
-                            self.current_lighter_price
-                        )
+                        await self.process_pending_lighter_hedges()
                         break
 
                     await asyncio.sleep(0.01)
                     if time.time() - start_time > 180:
-                        self.logger.error("❌ Timeout waiting for trade completion")
+                        self.trigger_circuit_breaker("Timeout waiting for buy trade completion")
                         break
 
                 if self.stop_flag:
@@ -1151,9 +1335,14 @@ class HedgeBot:
                 self.lighter_position = self.get_lighter_position()
                 self.backpack_position = await self.get_backpack_position()
                 self.logger.info(f"Selling up to -{self.max_position} | Backpack position: {self.backpack_position} | Lighter position: {self.lighter_position}")
-                if abs(self.backpack_position + self.lighter_position) > self.order_quantity*2:
+                if not await self.wait_for_market_data_health():
+                    continue
+                if not await self.check_exposure_limits():
+                    continue
+                if abs(self.backpack_position + self.lighter_position) > self.hard_exposure_limit:
                     self.logger.error(f"❌ Position diff is too large: {self.backpack_position + self.lighter_position}")
-                    sys.exit(1)
+                    self.trigger_circuit_breaker(f"Hard exposure breached in sell loop: {self.backpack_position + self.lighter_position}")
+                    raise RuntimeError("Hard exposure breach")
 
                 if iterations == self.iterations:
                     if self.backpack_position>0 and self.backpack_position <= self.order_quantity:
@@ -1161,6 +1350,8 @@ class HedgeBot:
 
                 self.order_execution_complete = False
                 self.waiting_for_lighter_fill = False
+                self.pending_lighter_hedges.clear()
+                start_time = time.time()
                 try:
                     # Determine side based on some logic (for now, alternate)
                     side = 'sell'
@@ -1176,16 +1367,12 @@ class HedgeBot:
                 while not self.order_execution_complete and not self.stop_flag:
                     # Check if Backpack order filled and we need to place Lighter order
                     if self.waiting_for_lighter_fill:
-                        await self.place_lighter_market_order(
-                            self.current_lighter_side,
-                            self.current_lighter_quantity,
-                            self.current_lighter_price
-                        )
+                        await self.process_pending_lighter_hedges()
                         break
 
                     await asyncio.sleep(0.01)
                     if time.time() - start_time > 180:
-                        self.logger.error("❌ Timeout waiting for trade completion")
+                        self.trigger_circuit_breaker("Timeout waiting for sell trade completion")
                         break
                 
                 if exit_after_next_trade:
