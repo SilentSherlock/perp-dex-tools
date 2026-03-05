@@ -67,6 +67,27 @@ class HedgeBot:
         self.base_lighter_slippage = min(self.max_lighter_slippage, self._safe_decimal_env('HEDGE_BASE_LIGHTER_SLIPPAGE', Decimal('0.0004')))
         self.max_basis_bps = max(Decimal('1'), self._safe_decimal_env('HEDGE_MAX_BASIS_BPS', Decimal('15')))
         self.basis_wait_timeout = float(self._safe_decimal_env('HEDGE_BASIS_WAIT_TIMEOUT_SEC', Decimal('3')))
+        self.pre_trade_alignment_enabled = self._safe_bool_env('HEDGE_PRE_TRADE_ALIGNMENT_ENABLED', False)
+        self.pre_trade_max_basis_bps = max(Decimal('0.5'), self._safe_decimal_env('HEDGE_PRE_TRADE_MAX_BASIS_BPS', Decimal('3')))
+        self.pre_trade_wait_timeout_seconds = float(self._safe_decimal_env('HEDGE_PRE_TRADE_WAIT_TIMEOUT_SEC', Decimal('1.5')))
+        self.pre_trade_retry_sleep_seconds = float(self._safe_decimal_env('HEDGE_PRE_TRADE_RETRY_SLEEP_SEC', Decimal('0.2')))
+        self.hedge_alignment_enabled = self._safe_bool_env('HEDGE_ALIGNMENT_ENABLED', True)
+        self.hedge_alignment_initial_bps = max(Decimal('0.5'), self._safe_decimal_env('HEDGE_ALIGNMENT_INITIAL_BPS', Decimal('3')))
+        self.hedge_alignment_max_bps = max(
+            self.hedge_alignment_initial_bps,
+            self._safe_decimal_env('HEDGE_ALIGNMENT_MAX_BPS', self.max_basis_bps)
+        )
+        self.hedge_alignment_widen_step_bps = max(Decimal('0'), self._safe_decimal_env('HEDGE_ALIGNMENT_WIDEN_STEP_BPS', Decimal('1')))
+        self.hedge_alignment_widen_interval_seconds = float(
+            self._safe_decimal_env('HEDGE_ALIGNMENT_WIDEN_INTERVAL_SEC', Decimal('0.5'))
+        )
+        self.hedge_alignment_wait_timeout_seconds = float(
+            self._safe_decimal_env('HEDGE_ALIGNMENT_WAIT_TIMEOUT_SEC', Decimal(str(self.basis_wait_timeout)))
+        )
+        self.hedge_alignment_retry_sleep_seconds = float(
+            self._safe_decimal_env('HEDGE_ALIGNMENT_RETRY_SLEEP_SEC', Decimal('0.1'))
+        )
+        self.hedge_alignment_force_on_timeout = self._safe_bool_env('HEDGE_ALIGNMENT_FORCE_ON_TIMEOUT', True)
         self.soft_exposure_limit = self.order_quantity * max(Decimal('1'), self._safe_decimal_env('HEDGE_SOFT_EXPOSURE_MULTIPLIER', Decimal('1.5')))
         self.hard_exposure_limit = self.order_quantity * max(Decimal('1'), self._safe_decimal_env('HEDGE_HARD_EXPOSURE_MULTIPLIER', Decimal('2')))
         if self.soft_exposure_limit > self.hard_exposure_limit:
@@ -199,6 +220,21 @@ class HedgeBot:
             else:
                 print(f"Warning: invalid decimal env {key}={raw}, fallback to {default}")
             return default
+
+    def _safe_bool_env(self, key: str, default: bool) -> bool:
+        raw = os.getenv(key)
+        if raw is None or raw == "":
+            return default
+        value = str(raw).strip().lower()
+        if value in {"1", "true", "yes", "y", "on"}:
+            return True
+        if value in {"0", "false", "no", "n", "off"}:
+            return False
+        if hasattr(self, "logger") and self.logger:
+            self.logger.warning(f"Invalid bool env {key}={raw}, fallback to {default}")
+        else:
+            print(f"Warning: invalid bool env {key}={raw}, fallback to {default}")
+        return default
 
     def trigger_circuit_breaker(self, reason: str):
         """Trigger a controlled stop when critical hedging risk is detected."""
@@ -808,22 +844,70 @@ class HedgeBot:
             return Decimal('0')
         return abs(hedge_price - reference_price) / reference_price * Decimal('10000')
 
-    async def wait_for_acceptable_basis(self, reference_price: Decimal, lighter_side: str) -> bool:
-        """Wait briefly for cross-exchange basis to return under threshold."""
+    def get_hedge_alignment_threshold_bps(self, elapsed_seconds: float, net_exposure: Optional[Decimal] = None) -> Decimal:
+        if net_exposure is not None and net_exposure >= self.hard_exposure_limit:
+            return self.hedge_alignment_max_bps
+        if self.hedge_alignment_widen_step_bps <= 0 or self.hedge_alignment_widen_interval_seconds <= 0:
+            return self.hedge_alignment_initial_bps
+        widen_rounds = int(elapsed_seconds / self.hedge_alignment_widen_interval_seconds)
+        widened = self.hedge_alignment_initial_bps + self.hedge_alignment_widen_step_bps * Decimal(str(widen_rounds))
+        return min(self.hedge_alignment_max_bps, widened)
+
+    async def wait_for_pre_trade_alignment(self, side: str) -> bool:
+        if not self.pre_trade_alignment_enabled:
+            return True
+        if self.backpack_best_bid is None or self.backpack_best_ask is None:
+            return False
+
+        reference_price = self.backpack_best_ask if side.lower() == "buy" else self.backpack_best_bid
+        lighter_side = "sell" if side.lower() == "buy" else "buy"
         start_time = time.time()
+        basis_bps = Decimal("0")
         while not self.stop_flag:
             best_bid, best_ask = self.get_lighter_best_levels()
             if best_bid and best_ask:
                 hedge_reference = best_ask[0] if lighter_side.lower() == 'buy' else best_bid[0]
                 basis_bps = self.calculate_basis_bps(reference_price, hedge_reference)
-                if basis_bps <= self.max_basis_bps:
-                    self.publish_risk_event(RiskEvent.BASIS_NORMAL, f"basis_bps={basis_bps:.2f}")
+                if basis_bps <= self.pre_trade_max_basis_bps:
                     return True
                 if basis_bps >= self.wide_basis_bps:
                     self.publish_risk_event(RiskEvent.BASIS_WIDE, f"basis_bps={basis_bps:.2f}")
-            if time.time() - start_time >= self.basis_wait_timeout:
+            if time.time() - start_time >= self.pre_trade_wait_timeout_seconds:
+                self.logger.info(
+                    f"Skip maker leg due to pre-trade basis: side={side}, "
+                    f"basis={basis_bps:.2f}bps > {self.pre_trade_max_basis_bps}bps"
+                )
                 return False
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(self.pre_trade_retry_sleep_seconds)
+        return False
+
+    async def wait_for_acceptable_basis(self, reference_price: Decimal, lighter_side: str) -> bool:
+        """Wait for hedge price alignment window before sending Lighter hedge order."""
+        if not self.hedge_alignment_enabled:
+            return True
+        start_time = time.time()
+        latest_basis_bps = Decimal("0")
+        latest_threshold_bps = self.hedge_alignment_initial_bps
+        while not self.stop_flag:
+            best_bid, best_ask = self.get_lighter_best_levels()
+            if best_bid and best_ask:
+                hedge_reference = best_ask[0] if lighter_side.lower() == 'buy' else best_bid[0]
+                latest_basis_bps = self.calculate_basis_bps(reference_price, hedge_reference)
+                elapsed = time.time() - start_time
+                net_exposure = abs(self.backpack_position + self.lighter_position)
+                latest_threshold_bps = self.get_hedge_alignment_threshold_bps(elapsed, net_exposure)
+                if latest_basis_bps <= latest_threshold_bps:
+                    self.publish_risk_event(RiskEvent.BASIS_NORMAL, f"basis_bps={latest_basis_bps:.2f}")
+                    return True
+                if latest_basis_bps >= self.wide_basis_bps:
+                    self.publish_risk_event(RiskEvent.BASIS_WIDE, f"basis_bps={latest_basis_bps:.2f}")
+            if time.time() - start_time >= self.hedge_alignment_wait_timeout_seconds:
+                self.logger.warning(
+                    f"Basis alignment timeout: basis={latest_basis_bps:.2f}bps threshold={latest_threshold_bps:.2f}bps "
+                    f"side={lighter_side} timeout={self.hedge_alignment_wait_timeout_seconds}s"
+                )
+                return False
+            await asyncio.sleep(self.hedge_alignment_retry_sleep_seconds)
         return False
 
     def is_market_data_healthy(self) -> bool:
@@ -1120,8 +1204,18 @@ class HedgeBot:
             is_ask = True
         basis_ok = await self.wait_for_acceptable_basis(price, lighter_side)
         if not basis_ok:
+            if not self.hedge_alignment_force_on_timeout:
+                self.publish_risk_event(
+                    RiskEvent.LIGHTER_HEDGE_ERROR,
+                    f"basis_alignment_timeout side={lighter_side}"
+                )
+                self.logger.warning(
+                    f"Skip hedge due to alignment timeout: side={lighter_side}, "
+                    f"force_on_timeout={self.hedge_alignment_force_on_timeout}"
+                )
+                return None
             self.logger.warning(
-                f"⚠️ Basis still above threshold after {self.basis_wait_timeout}s, proceed to avoid naked exposure"
+                f"⚠️ Basis still above threshold after {self.hedge_alignment_wait_timeout_seconds}s, proceed to avoid naked exposure"
             )
             best_bid, best_ask = self.get_lighter_best_levels()
             if best_bid is None or best_ask is None:
@@ -1507,6 +1601,9 @@ class HedgeBot:
                 try:
                     # Determine side based on some logic (for now, alternate)
                     side = 'buy'
+                    if not await self.wait_for_pre_trade_alignment(side):
+                        await asyncio.sleep(self.pre_trade_retry_sleep_seconds)
+                        continue
                     maker_quantity = self.get_state_adjusted_order_quantity(self.order_quantity)
                     if maker_quantity <= 0:
                         self.logger.warning("⚠️ Buy maker quantity is zero after normalization, skip this cycle")
@@ -1571,6 +1668,9 @@ class HedgeBot:
                 try:
                     # Determine side based on some logic (for now, alternate)
                     side = 'sell'
+                    if not await self.wait_for_pre_trade_alignment(side):
+                        await asyncio.sleep(self.pre_trade_retry_sleep_seconds)
+                        continue
                     if exit_after_next_trade:
                         exit_quantity = self.normalize_backpack_order_quantity(abs(self.backpack_position), allow_skip=True)
                         if exit_quantity <= 0:

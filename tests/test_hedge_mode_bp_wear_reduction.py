@@ -70,6 +70,20 @@ def _make_bot():
     risk_state = importlib.import_module("hedge.hedge_mode_bp").RiskState
     bot.risk_state = risk_state.NORMAL
     bot.wide_basis_bps = Decimal("25")
+    bot.hedge_alignment_enabled = True
+    bot.hedge_alignment_initial_bps = Decimal("3")
+    bot.hedge_alignment_max_bps = Decimal("8")
+    bot.hedge_alignment_widen_step_bps = Decimal("1")
+    bot.hedge_alignment_widen_interval_seconds = 0.5
+    bot.hedge_alignment_wait_timeout_seconds = 1.5
+    bot.hedge_alignment_retry_sleep_seconds = 0.01
+    bot.hedge_alignment_force_on_timeout = True
+    bot.pre_trade_alignment_enabled = False
+    bot.pre_trade_max_basis_bps = Decimal("3")
+    bot.pre_trade_wait_timeout_seconds = 0.2
+    bot.pre_trade_retry_sleep_seconds = 0.01
+    bot.backpack_best_bid = Decimal("99.9")
+    bot.backpack_best_ask = Decimal("100.1")
     return bot
 
 
@@ -176,3 +190,22 @@ def test_process_pending_lighter_hedges_drains_queue():
     ]
     assert bot.pending_lighter_hedges == []
     assert bot.waiting_for_lighter_fill is False
+
+
+def test_hedge_alignment_threshold_widens_over_time():
+    bot = _make_bot()
+    first = bot.get_hedge_alignment_threshold_bps(0.0, Decimal("0.1"))
+    later = bot.get_hedge_alignment_threshold_bps(1.1, Decimal("0.1"))
+    hard_exposure = bot.get_hedge_alignment_threshold_bps(0.1, Decimal("2.1"))
+    assert first == Decimal("3")
+    assert later == Decimal("5")
+    assert hard_exposure == Decimal("8")
+
+
+def test_wait_for_pre_trade_alignment_returns_true_when_basis_in_threshold():
+    bot = _make_bot()
+    bot.pre_trade_alignment_enabled = True
+    bot.pre_trade_max_basis_bps = Decimal("20")
+    bot.get_lighter_best_levels = lambda: ((Decimal("100.0"), Decimal("1")), (Decimal("100.2"), Decimal("1")))
+    result = asyncio.run(bot.wait_for_pre_trade_alignment("buy"))
+    assert result is True
