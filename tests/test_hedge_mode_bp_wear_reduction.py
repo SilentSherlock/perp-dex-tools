@@ -90,6 +90,9 @@ def _make_bot():
     bot.requote_min_age_seconds = 0.8
     bot.requote_secondary_timeout_seconds = 0
     bot.last_requote_reason = ""
+    bot.lighter_order_failed = False
+    bot.lighter_order_failure_reason = None
+    bot.active_lighter_client_order_id = None
     return bot
 
 
@@ -234,3 +237,24 @@ def test_should_requote_uses_time_as_secondary_fallback():
     should = asyncio.run(bot.should_requote_backpack_order("buy", Decimal("100.0"), start))
     assert should is True
     assert "time_fallback" in bot.last_requote_reason
+
+
+def test_handle_lighter_order_terminal_update_marks_failed():
+    bot = _make_bot()
+    bot.active_lighter_client_order_id = "123"
+    bot.lighter_order_contexts = {"123": {"stage": "within_initial_band"}}
+    bot.handle_lighter_order_terminal_update({"client_order_id": "123", "status": "canceled"})
+    assert bot.lighter_order_failed is True
+    assert bot.lighter_order_failure_reason == "order_canceled"
+    assert bot.active_lighter_client_order_id is None
+    assert "123" not in bot.lighter_order_contexts
+
+
+def test_monitor_lighter_order_exits_on_terminal_failure():
+    bot = _make_bot()
+    bot.lighter_fill_timeout_seconds = 30
+    bot.lighter_order_filled = False
+    bot.lighter_order_failed = True
+    bot.lighter_order_failure_reason = "order_canceled"
+    result = asyncio.run(bot.monitor_lighter_order(123))
+    assert result is False

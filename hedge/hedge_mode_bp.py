@@ -186,6 +186,9 @@ class HedgeBot:
         self.lighter_order_side = None
         self.lighter_order_size = None
         self.lighter_order_start_time = None
+        self.active_lighter_client_order_id = None
+        self.lighter_order_failed = False
+        self.lighter_order_failure_reason = None
 
         # Strategy state
         self.waiting_for_lighter_fill = False
@@ -500,10 +503,37 @@ class HedgeBot:
 
             # Mark execution as complete
             self.lighter_order_filled = True  # Mark order as filled
+            self.lighter_order_failed = False
+            self.lighter_order_failure_reason = None
+            self.active_lighter_client_order_id = None
             self.order_execution_complete = True
 
         except Exception as e:
             self.logger.error(f"Error handling Lighter order result: {e}")
+
+    def handle_lighter_order_terminal_update(self, order_data):
+        """Handle non-filled terminal update (cancel/reject/expire) for active Lighter order."""
+        try:
+            status = str(order_data.get("status", "")).lower()
+            if status not in {"canceled", "cancelled", "rejected", "expired"}:
+                return
+            client_order_id = str(order_data.get("client_order_id", ""))
+            if not client_order_id:
+                return
+            if self.active_lighter_client_order_id and client_order_id != str(self.active_lighter_client_order_id):
+                return
+
+            self.lighter_order_status = status.upper()
+            self.lighter_order_filled = False
+            self.lighter_order_failed = True
+            self.lighter_order_failure_reason = f"order_{status}"
+            self.active_lighter_client_order_id = None
+            self.lighter_order_contexts.pop(client_order_id, None)
+            self.logger.warning(
+                f"[{client_order_id}] [Lighter] terminal status received: {status}, will retry hedge"
+            )
+        except Exception as e:
+            self.logger.error(f"Error handling Lighter terminal update: {e}")
 
     async def reset_lighter_order_book(self):
         """Reset Lighter order book state."""
@@ -730,8 +760,10 @@ class HedgeBot:
                                     # Handle account orders updates
                                     orders = data.get("orders", {}).get(str(self.lighter_market_index), [])
                                     for order in orders:
-                                        if order.get("status") == "filled":
+                                        if str(order.get("status", "")).lower() == "filled":
                                             self.handle_lighter_order_result(order)
+                                        else:
+                                            self.handle_lighter_order_terminal_update(order)
                                 elif data.get("type") == "update/order_book" and not self.lighter_snapshot_loaded:
                                     # Ignore updates until we have the initial snapshot
                                     continue
@@ -1401,12 +1433,15 @@ class HedgeBot:
 
         # Reset order state
         self.lighter_order_filled = False
+        self.lighter_order_failed = False
+        self.lighter_order_failure_reason = None
         self.lighter_order_price = normalized_price
         self.lighter_order_side = lighter_side
         self.lighter_order_size = normalized_quantity
 
         try:
             client_order_index = int(time.time() * 1000)
+            self.active_lighter_client_order_id = str(client_order_index)
             # Sign the order transaction
             tx, tx_hash, error = await self.lighter_client.create_order(
                 market_index=self.lighter_market_index,
@@ -1438,20 +1473,27 @@ class HedgeBot:
                 f"{alignment_info.get('threshold_bps', Decimal('0')):.2f}bps)"
             )
 
-            await self.monitor_lighter_order(client_order_index)
+            order_filled = await self.monitor_lighter_order(client_order_index)
+            if not order_filled:
+                return None
 
             return tx_hash
         except Exception as e:
+            self.active_lighter_client_order_id = None
             self.logger.error(f"❌ Error placing Lighter order: {e}")
             self.publish_risk_event(RiskEvent.LIGHTER_HEDGE_ERROR, f"lighter_place_error={e}")
             return None
 
-    async def monitor_lighter_order(self, client_order_index: int):
+    async def monitor_lighter_order(self, client_order_index: int) -> bool:
         """Monitor Lighter order and adjust price if needed."""
 
         start_time = time.time()
         timeout_round = 0
         while not self.lighter_order_filled and not self.stop_flag:
+            if self.lighter_order_failed:
+                reason = self.lighter_order_failure_reason or "order_terminal"
+                self.logger.warning(f"⚠️ Lighter order monitor ended: order_id={client_order_index}, reason={reason}")
+                return False
             # Check timeout window and continue waiting with retry logging
             if time.time() - start_time > self.lighter_fill_timeout_seconds:
                 timeout_round += 1
@@ -1467,6 +1509,7 @@ class HedgeBot:
                 await asyncio.sleep(self.lighter_timeout_retry_sleep_seconds)
 
             await asyncio.sleep(0.1)  # Check every 100ms
+        return self.lighter_order_filled
 
     async def modify_lighter_order(self, client_order_index: int, new_price: Decimal):
         """Modify current Lighter order with new price using client_order_index."""
