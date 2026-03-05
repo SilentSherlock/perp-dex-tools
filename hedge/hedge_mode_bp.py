@@ -91,6 +91,8 @@ class HedgeBot:
         self.requote_price_drift_ticks = max(Decimal('1'), self._safe_decimal_env('HEDGE_REQUOTE_DRIFT_TICKS', Decimal('2')))
         self.requote_min_age_seconds = float(self._safe_decimal_env('HEDGE_REQUOTE_MIN_AGE_SEC', Decimal('0.8')))
         self.requote_secondary_timeout_seconds = float(self._safe_decimal_env('HEDGE_REQUOTE_SECONDARY_TIMEOUT_SEC', Decimal('0')))
+        self.hedge_stats_log_interval_seconds = float(self._safe_decimal_env('HEDGE_STATS_LOG_INTERVAL_SEC', Decimal('30')))
+        self.hedge_stats_log_every_n_fills = max(1, self._safe_int_env('HEDGE_STATS_LOG_EVERY_N_FILLS', 50))
         self.soft_exposure_limit = self.order_quantity * max(Decimal('1'), self._safe_decimal_env('HEDGE_SOFT_EXPOSURE_MULTIPLIER', Decimal('1.5')))
         self.hard_exposure_limit = self.order_quantity * max(Decimal('1'), self._safe_decimal_env('HEDGE_HARD_EXPOSURE_MULTIPLIER', Decimal('2')))
         if self.soft_exposure_limit > self.hard_exposure_limit:
@@ -201,6 +203,10 @@ class HedgeBot:
         self.lighter_order_info = None
         self.pending_lighter_hedges: List[Dict[str, Any]] = []
         self.backpack_order_hedged_size: Dict[str, Decimal] = {}
+        self.lighter_order_contexts: Dict[str, Dict[str, Any]] = {}
+        self.hedge_stage_stats: Dict[str, Dict[str, Decimal]] = {}
+        self.total_hedge_fills = 0
+        self._last_hedge_stats_log_time = time.time()
 
         # Lighter API configuration
         self.lighter_base_url = "https://mainnet.zklighter.elliot.ai"
@@ -240,6 +246,19 @@ class HedgeBot:
             print(f"Warning: invalid bool env {key}={raw}, fallback to {default}")
         return default
 
+    def _safe_int_env(self, key: str, default: int) -> int:
+        raw = os.getenv(key)
+        if raw is None or raw == "":
+            return default
+        try:
+            return int(raw)
+        except Exception:
+            if hasattr(self, "logger") and self.logger:
+                self.logger.warning(f"Invalid int env {key}={raw}, fallback to {default}")
+            else:
+                print(f"Warning: invalid int env {key}={raw}, fallback to {default}")
+            return default
+
     def log_execution_control_config(self):
         self.logger.info(
             "Execution controls: "
@@ -253,8 +272,63 @@ class HedgeBot:
             f"hedge_force_on_timeout={self.hedge_alignment_force_on_timeout}, "
             f"requote_drift_ticks={self.requote_price_drift_ticks}, "
             f"requote_min_age={self.requote_min_age_seconds}s, "
-            f"requote_secondary_timeout={self.get_secondary_requote_timeout()}s"
+            f"requote_secondary_timeout={self.get_secondary_requote_timeout()}s, "
+            f"stats_interval={self.hedge_stats_log_interval_seconds}s, "
+            f"stats_every_fills={self.hedge_stats_log_every_n_fills}"
         )
+
+    def _ensure_stage_stats(self, stage: str) -> Dict[str, Decimal]:
+        if stage not in self.hedge_stage_stats:
+            self.hedge_stage_stats[stage] = {
+                "fills": Decimal("0"),
+                "volume_usd": Decimal("0"),
+                "wear_usd": Decimal("0"),
+            }
+        return self.hedge_stage_stats[stage]
+
+    def record_hedge_fill_stats(self, stage: str, reference_price: Decimal, filled_price: Decimal, filled_quantity: Decimal):
+        if reference_price <= 0 or filled_quantity <= 0:
+            return
+        stats = self._ensure_stage_stats(stage or "unknown")
+        volume_usd = abs(reference_price * filled_quantity)
+        wear_usd = abs(filled_price - reference_price) * filled_quantity
+        stats["fills"] += Decimal("1")
+        stats["volume_usd"] += volume_usd
+        stats["wear_usd"] += wear_usd
+        self.total_hedge_fills += 1
+        self.maybe_log_hedge_stage_stats()
+
+    def maybe_log_hedge_stage_stats(self, force: bool = False):
+        now = time.time()
+        stale_order_ids = [
+            order_id for order_id, context in self.lighter_order_contexts.items()
+            if now - float(context.get("created_at", now)) > 3600
+        ]
+        for order_id in stale_order_ids:
+            self.lighter_order_contexts.pop(order_id, None)
+        if not force:
+            interval_ready = (now - self._last_hedge_stats_log_time) >= self.hedge_stats_log_interval_seconds
+            count_ready = (self.total_hedge_fills % self.hedge_stats_log_every_n_fills) == 0
+            if not interval_ready and not count_ready:
+                return
+        self._last_hedge_stats_log_time = now
+        if not self.hedge_stage_stats:
+            return
+
+        total_volume = sum(v["volume_usd"] for v in self.hedge_stage_stats.values())
+        total_wear = sum(v["wear_usd"] for v in self.hedge_stage_stats.values())
+        total_bps = (total_wear / total_volume * Decimal("10000")) if total_volume > 0 else Decimal("0")
+        self.logger.info(
+            f"[HEDGE-STATS][TOTAL] fills={self.total_hedge_fills} volume={total_volume:.2f}USD "
+            f"wear={total_wear:.4f}USD wear_bps={total_bps:.3f}"
+        )
+        for stage in sorted(self.hedge_stage_stats.keys()):
+            item = self.hedge_stage_stats[stage]
+            stage_bps = (item["wear_usd"] / item["volume_usd"] * Decimal("10000")) if item["volume_usd"] > 0 else Decimal("0")
+            self.logger.info(
+                f"[HEDGE-STATS][{stage}] fills={int(item['fills'])} volume={item['volume_usd']:.2f}USD "
+                f"wear={item['wear_usd']:.4f}USD wear_bps={stage_bps:.3f}"
+            )
 
     def trigger_circuit_breaker(self, reason: str):
         """Trigger a controlled stop when critical hedging risk is detected."""
@@ -340,6 +414,7 @@ class HedgeBot:
         """Graceful shutdown handler."""
         self.stop_flag = True
         self.logger.info("\n🛑 Stopping...")
+        self.maybe_log_hedge_stage_stats(force=True)
 
         # Close WebSocket connections
         if self.backpack_client:
@@ -404,9 +479,16 @@ class HedgeBot:
                 self.lighter_position += Decimal(order_data["filled_base_amount"])
             
             client_order_index = order_data["client_order_id"]
+            context = self.lighter_order_contexts.pop(str(client_order_index), None)
 
             self.logger.info(f"[{client_order_index}] [{order_type}] [Lighter] [FILLED]: "
                              f"{order_data['filled_base_amount']} @ {order_data['avg_filled_price']}")
+            if context:
+                filled_qty = Decimal(order_data["filled_base_amount"])
+                filled_price = Decimal(order_data["avg_filled_price"])
+                reference_price = Decimal(context.get("reference_price", "0"))
+                stage = str(context.get("stage", "unknown"))
+                self.record_hedge_fill_stats(stage, reference_price, filled_price, filled_qty)
 
             # Log Lighter trade to CSV
             self.log_trade_to_csv(
@@ -909,10 +991,14 @@ class HedgeBot:
             await asyncio.sleep(self.pre_trade_retry_sleep_seconds)
         return False
 
-    async def wait_for_acceptable_basis(self, reference_price: Decimal, lighter_side: str) -> bool:
+    async def wait_for_acceptable_basis(self, reference_price: Decimal, lighter_side: str) -> Tuple[bool, Dict[str, Decimal]]:
         """Wait for hedge price alignment window before sending Lighter hedge order."""
         if not self.hedge_alignment_enabled:
-            return True
+            return True, {
+                "basis_bps": Decimal("0"),
+                "threshold_bps": Decimal("0"),
+                "stage": "alignment_disabled",
+            }
         start_time = time.time()
         last_log_time = 0.0
         latest_basis_bps = Decimal("0")
@@ -927,7 +1013,12 @@ class HedgeBot:
                 latest_threshold_bps = self.get_hedge_alignment_threshold_bps(elapsed, net_exposure)
                 if latest_basis_bps <= latest_threshold_bps:
                     self.publish_risk_event(RiskEvent.BASIS_NORMAL, f"basis_bps={latest_basis_bps:.2f}")
-                    return True
+                    stage = "within_initial_band" if latest_threshold_bps <= self.hedge_alignment_initial_bps else "within_widened_band"
+                    return True, {
+                        "basis_bps": latest_basis_bps,
+                        "threshold_bps": latest_threshold_bps,
+                        "stage": stage,
+                    }
                 if latest_basis_bps >= self.wide_basis_bps:
                     self.publish_risk_event(RiskEvent.BASIS_WIDE, f"basis_bps={latest_basis_bps:.2f}")
                 now = time.time()
@@ -942,9 +1033,17 @@ class HedgeBot:
                     f"Basis alignment timeout: basis={latest_basis_bps:.2f}bps threshold={latest_threshold_bps:.2f}bps "
                     f"side={lighter_side} timeout={self.hedge_alignment_wait_timeout_seconds}s"
                 )
-                return False
+                return False, {
+                    "basis_bps": latest_basis_bps,
+                    "threshold_bps": latest_threshold_bps,
+                    "stage": "alignment_timeout",
+                }
             await asyncio.sleep(self.hedge_alignment_retry_sleep_seconds)
-        return False
+        return False, {
+            "basis_bps": latest_basis_bps,
+            "threshold_bps": latest_threshold_bps,
+            "stage": "alignment_interrupted",
+        }
 
     def is_market_data_healthy(self) -> bool:
         if not self.backpack_order_book_ready or not self.lighter_order_book_ready:
@@ -1259,6 +1358,7 @@ class HedgeBot:
     async def place_lighter_market_order(self, lighter_side: str, quantity: Decimal, price: Decimal):
         if not self.lighter_client:
             await self.initialize_lighter_client()
+        reference_price = price
 
         best_bid, best_ask = self.get_lighter_best_levels()
         if best_bid is None or best_ask is None:
@@ -1273,7 +1373,8 @@ class HedgeBot:
         else:
             order_type = "OPEN"
             is_ask = True
-        basis_ok = await self.wait_for_acceptable_basis(price, lighter_side)
+        basis_ok, alignment_info = await self.wait_for_acceptable_basis(reference_price, lighter_side)
+        hedge_stage = alignment_info.get("stage", "alignment_unknown")
         if not basis_ok:
             if not self.hedge_alignment_force_on_timeout:
                 self.publish_risk_event(
@@ -1285,6 +1386,7 @@ class HedgeBot:
                     f"force_on_timeout={self.hedge_alignment_force_on_timeout}"
                 )
                 return None
+            hedge_stage = "alignment_timeout_forced"
             self.logger.warning(
                 f"⚠️ Basis still above threshold after {self.hedge_alignment_wait_timeout_seconds}s, proceed to avoid naked exposure"
             )
@@ -1321,7 +1423,20 @@ class HedgeBot:
                 raise Exception(f"Error placing Lighter order: {error}")
 
             slippage_bps = self.compute_lighter_slippage(best_bid[0], best_ask[0]) * Decimal('10000')
-            self.logger.info(f"[{client_order_index}] [{order_type}] [Lighter] [OPEN]: {normalized_quantity} @ {normalized_price} (slippage={slippage_bps:.2f}bps)")
+            self.lighter_order_contexts[str(client_order_index)] = {
+                "stage": hedge_stage,
+                "reference_price": reference_price,
+                "reference_quantity": quantity,
+                "basis_bps": alignment_info.get("basis_bps", Decimal("0")),
+                "threshold_bps": alignment_info.get("threshold_bps", Decimal("0")),
+                "created_at": time.time(),
+            }
+            self.logger.info(
+                f"[{client_order_index}] [{order_type}] [Lighter] [OPEN]: {normalized_quantity} @ {normalized_price} "
+                f"(slippage={slippage_bps:.2f}bps, stage={hedge_stage}, "
+                f"basis={alignment_info.get('basis_bps', Decimal('0')):.2f}bps/"
+                f"{alignment_info.get('threshold_bps', Decimal('0')):.2f}bps)"
+            )
 
             await self.monitor_lighter_order(client_order_index)
 
