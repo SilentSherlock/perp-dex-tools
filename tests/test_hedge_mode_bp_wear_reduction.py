@@ -54,8 +54,10 @@ def _make_bot():
     bot.tick_size = Decimal("0.01")
     bot.base_amount_multiplier = 1000
     bot.price_multiplier = 100
+    bot.lighter_timeout_retry_sleep_seconds = 0.01
     bot.soft_exposure_limit = Decimal("1.5")
     bot.hard_exposure_limit = Decimal("2.0")
+    bot.absolute_exposure_limit = Decimal("10.0")
     bot.backpack_position = Decimal("0")
     bot.lighter_position = Decimal("0")
     bot.pending_lighter_hedges = []
@@ -105,17 +107,24 @@ def test_check_exposure_limits_soft_limit_throttles(monkeypatch):
     assert bot.stop_flag is False
 
 
-def test_check_exposure_limits_hard_limit_triggers_circuit_breaker():
+def test_check_exposure_limits_hard_limit_requests_smoothing():
     bot = _make_bot()
     bot.backpack_position = Decimal("2.2")
     bot.lighter_position = Decimal("0.2")
+    result = asyncio.run(bot.check_exposure_limits())
+    assert result is False
+    assert bot.circuit_breaker_triggered is False
 
+
+def test_check_exposure_limits_absolute_limit_triggers_circuit_breaker():
+    bot = _make_bot()
+    bot.backpack_position = Decimal("20")
+    bot.lighter_position = Decimal("0")
     try:
         asyncio.run(bot.check_exposure_limits())
         assert False, "Expected RuntimeError"
     except RuntimeError:
         pass
-
     assert bot.circuit_breaker_triggered is True
     assert bot.stop_flag is True
 
@@ -133,7 +142,8 @@ def test_trade_timeout_event_triggers_circuit_breaker():
     module = importlib.import_module("hedge.hedge_mode_bp")
     bot = _make_bot()
     bot.publish_risk_event(module.RiskEvent.TRADE_COMPLETION_TIMEOUT, "timeout", force=True)
-    assert bot.circuit_breaker_triggered is True
+    assert bot.circuit_breaker_triggered is False
+    assert bot.risk_state == module.RiskState.WIDE
 
 
 def test_wide_state_quantity_respects_backpack_minimum():
@@ -151,6 +161,7 @@ def test_process_pending_lighter_hedges_drains_queue():
 
     async def _fake_place(side, quantity, price):
         called.append((side, quantity, price))
+        return "ok"
 
     bot.place_lighter_market_order = _fake_place
     bot.pending_lighter_hedges = [

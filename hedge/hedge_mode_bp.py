@@ -73,6 +73,9 @@ class HedgeBot:
             self.soft_exposure_limit = self.hard_exposure_limit
         self.event_cooldown_seconds = float(self._safe_decimal_env('HEDGE_EVENT_COOLDOWN_SEC', Decimal('1')))
         self.wide_basis_bps = max(self.max_basis_bps, self._safe_decimal_env('HEDGE_WIDE_BASIS_BPS', Decimal('25')))
+        self.lighter_fill_timeout_seconds = float(self._safe_decimal_env('HEDGE_LIGHTER_FILL_TIMEOUT_SEC', Decimal('30')))
+        self.lighter_timeout_retry_sleep_seconds = float(self._safe_decimal_env('HEDGE_LIGHTER_TIMEOUT_RETRY_SLEEP_SEC', Decimal('2')))
+        self.absolute_exposure_limit = self.order_quantity * max(Decimal('100'), self._safe_decimal_env('HEDGE_ABSOLUTE_EXPOSURE_MULTIPLIER', Decimal('100')))
         self.state_changed_at = time.time()
         self.risk_state = RiskState.NORMAL
         self._last_event_time: Dict[str, float] = {}
@@ -244,13 +247,12 @@ class HedgeBot:
                 self.transition_risk_state(RiskState.NORMAL, detail or "basis_normal")
         elif event == RiskEvent.SOFT_EXPOSURE_BREACH:
             self.transition_risk_state(RiskState.WIDE, detail or "soft_exposure")
-        elif event in [
-            RiskEvent.HARD_EXPOSURE_BREACH,
-            RiskEvent.LIGHTER_HEDGE_TIMEOUT,
-            RiskEvent.LIGHTER_HEDGE_ERROR,
-            RiskEvent.TRADE_COMPLETION_TIMEOUT,
-        ]:
+        elif event == RiskEvent.HARD_EXPOSURE_BREACH:
             self.trigger_circuit_breaker(detail or event.value)
+        elif event in [RiskEvent.LIGHTER_HEDGE_TIMEOUT, RiskEvent.TRADE_COMPLETION_TIMEOUT]:
+            self.transition_risk_state(RiskState.WIDE, detail or event.value)
+        elif event == RiskEvent.LIGHTER_HEDGE_ERROR:
+            self.transition_risk_state(RiskState.STRESSED, detail or event.value)
 
     def get_state_adjusted_sleep_seconds(self) -> float:
         if self.risk_state == RiskState.STRESSED:
@@ -878,24 +880,35 @@ class HedgeBot:
     async def process_pending_lighter_hedges(self):
         """Execute queued hedge legs in FIFO order."""
         while self.pending_lighter_hedges and not self.stop_flag:
-            hedge_task = self.pending_lighter_hedges.pop(0)
-            await self.place_lighter_market_order(
+            hedge_task = self.pending_lighter_hedges[0]
+            result = await self.place_lighter_market_order(
                 hedge_task['lighter_side'],
                 hedge_task['quantity'],
                 hedge_task['price']
             )
+            if result is not None:
+                self.pending_lighter_hedges.pop(0)
+            else:
+                await asyncio.sleep(self.lighter_timeout_retry_sleep_seconds)
+                break
         self.waiting_for_lighter_fill = len(self.pending_lighter_hedges) > 0
 
     async def check_exposure_limits(self) -> bool:
         """Apply soft/hard exposure controls."""
         net_exposure = abs(self.backpack_position + self.lighter_position)
-        if net_exposure > self.hard_exposure_limit:
+        if net_exposure > self.absolute_exposure_limit:
             self.publish_risk_event(
                 RiskEvent.HARD_EXPOSURE_BREACH,
-                f"net_exposure={net_exposure} hard_limit={self.hard_exposure_limit}",
+                f"net_exposure={net_exposure} absolute_limit={self.absolute_exposure_limit}",
                 force=True
             )
-            raise RuntimeError("Hard exposure limit breached")
+            raise RuntimeError("Absolute exposure limit breached")
+        if net_exposure > self.hard_exposure_limit:
+            self.publish_risk_event(
+                RiskEvent.SOFT_EXPOSURE_BREACH,
+                f"net_exposure={net_exposure} hard_limit={self.hard_exposure_limit}"
+            )
+            return False
         if net_exposure > self.soft_exposure_limit:
             self.publish_risk_event(
                 RiskEvent.SOFT_EXPOSURE_BREACH,
@@ -907,6 +920,46 @@ class HedgeBot:
             await asyncio.sleep(1 + self.get_state_adjusted_sleep_seconds())
             return False
         return True
+
+    async def refresh_positions(self):
+        self.lighter_position = self.get_lighter_position()
+        self.backpack_position = await self.get_backpack_position()
+
+    async def smooth_position_gap(self) -> bool:
+        """Reduce cross-exchange position gap in chunks of order_quantity."""
+        max_smooth_rounds = 50
+        smooth_round = 0
+        while not self.stop_flag:
+            await self.refresh_positions()
+            position_gap = self.backpack_position + self.lighter_position
+            if abs(position_gap) <= self.order_quantity:
+                return True
+            if smooth_round >= max_smooth_rounds:
+                self.logger.warning("⚠️ Position smoothing reached max rounds, will retry in next cycle")
+                return False
+
+            smooth_round += 1
+            smooth_qty = min(abs(position_gap), self.order_quantity)
+            smooth_qty = self.normalize_backpack_order_quantity(smooth_qty, allow_skip=True)
+            if smooth_qty <= 0:
+                self.logger.warning(
+                    f"⚠️ Position gap {position_gap} below min tradable quantity {self.backpack_min_quantity}"
+                )
+                return True
+
+            lighter_side = 'sell' if position_gap > 0 else 'buy'
+            self.logger.warning(
+                f"⚠️ Smoothing position gap={position_gap} via Lighter {lighter_side} {smooth_qty} "
+                f"(round={smooth_round})"
+            )
+            hedge_result = await self.place_lighter_market_order(
+                lighter_side,
+                smooth_qty,
+                self.backpack_best_bid if lighter_side == 'sell' else self.backpack_best_ask
+            )
+            if hedge_result is None:
+                await asyncio.sleep(self.lighter_timeout_retry_sleep_seconds)
+                return False
 
     async def place_bbo_order(self, side: str, quantity: Decimal):
         # Get best bid/ask prices
@@ -1110,28 +1163,28 @@ class HedgeBot:
             return tx_hash
         except Exception as e:
             self.logger.error(f"❌ Error placing Lighter order: {e}")
-            self.publish_risk_event(RiskEvent.LIGHTER_HEDGE_ERROR, f"lighter_place_error={e}", force=True)
-            self.trigger_circuit_breaker(f"Lighter hedge placement failed: {e}")
-            raise
+            self.publish_risk_event(RiskEvent.LIGHTER_HEDGE_ERROR, f"lighter_place_error={e}")
+            return None
 
     async def monitor_lighter_order(self, client_order_index: int):
         """Monitor Lighter order and adjust price if needed."""
 
         start_time = time.time()
+        timeout_round = 0
         while not self.lighter_order_filled and not self.stop_flag:
-            # Check for timeout (30 seconds total)
-            if time.time() - start_time > 30:
+            # Check timeout window and continue waiting with retry logging
+            if time.time() - start_time > self.lighter_fill_timeout_seconds:
+                timeout_round += 1
                 self.logger.error(f"❌ Timeout waiting for Lighter order fill after {time.time() - start_time:.1f}s")
                 self.logger.error(f"❌ Order state - Filled: {self.lighter_order_filled}")
 
                 # Hard stop on timeout to avoid fake hedging
                 self.publish_risk_event(
                     RiskEvent.LIGHTER_HEDGE_TIMEOUT,
-                    f"order_id={client_order_index}",
-                    force=True
+                    f"order_id={client_order_index}, rounds={timeout_round}",
                 )
-                self.trigger_circuit_breaker(f"Lighter hedge timeout for order {client_order_index}")
-                raise TimeoutError(f"Lighter order timeout: {client_order_index}")
+                start_time = time.time()
+                await asyncio.sleep(self.lighter_timeout_retry_sleep_seconds)
 
             await asyncio.sleep(0.1)  # Check every 100ms
 
@@ -1420,6 +1473,11 @@ class HedgeBot:
         iterations = 0
         self.lighter_position = self.get_lighter_position()
         self.backpack_position = await self.get_backpack_position()
+        if abs(self.backpack_position + self.lighter_position) > self.order_quantity:
+            self.logger.warning(
+                f"⚠️ Initial position gap detected: {self.backpack_position + self.lighter_position}, start smoothing..."
+            )
+            await self.smooth_position_gap()
         while iterations < self.iterations and not self.stop_flag:
             iterations += 1
             self.logger.info("-----------------------------------------------")
@@ -1427,17 +1485,17 @@ class HedgeBot:
             self.logger.info("-----------------------------------------------")
 
             while self.backpack_position < self.max_position and not self.stop_flag:
-                self.lighter_position = self.get_lighter_position()
-                self.backpack_position = await self.get_backpack_position()
+                await self.refresh_positions()
                 self.logger.info(f"Buying up to {self.max_position} | Backpack position: {self.backpack_position} | Lighter position: {self.lighter_position}")
                 if not await self.wait_for_market_data_health():
                     continue
                 if not await self.check_exposure_limits():
+                    await self.smooth_position_gap()
                     continue
                 if self.risk_state == RiskState.STRESSED:
                     await asyncio.sleep(self.get_state_adjusted_sleep_seconds())
                     continue
-                if abs(self.backpack_position + self.lighter_position) > self.hard_exposure_limit:
+                if abs(self.backpack_position + self.lighter_position) > self.absolute_exposure_limit:
                     self.logger.error(f"❌ Position diff is too large: {self.backpack_position + self.lighter_position}")
                     self.trigger_circuit_breaker(f"Hard exposure breached in buy loop: {self.backpack_position + self.lighter_position}")
                     raise RuntimeError("Hard exposure breach")
@@ -1475,7 +1533,8 @@ class HedgeBot:
                             "buy_trade_completion_timeout",
                             force=True
                         )
-                        break
+                        start_time = time.time()
+                        await asyncio.sleep(self.lighter_timeout_retry_sleep_seconds)
 
                 if self.stop_flag:
                     break
@@ -1486,17 +1545,17 @@ class HedgeBot:
 
             exit_after_next_trade = False
             while self.backpack_position > -1*self.max_position and not self.stop_flag:
-                self.lighter_position = self.get_lighter_position()
-                self.backpack_position = await self.get_backpack_position()
+                await self.refresh_positions()
                 self.logger.info(f"Selling up to -{self.max_position} | Backpack position: {self.backpack_position} | Lighter position: {self.lighter_position}")
                 if not await self.wait_for_market_data_health():
                     continue
                 if not await self.check_exposure_limits():
+                    await self.smooth_position_gap()
                     continue
                 if self.risk_state == RiskState.STRESSED:
                     await asyncio.sleep(self.get_state_adjusted_sleep_seconds())
                     continue
-                if abs(self.backpack_position + self.lighter_position) > self.hard_exposure_limit:
+                if abs(self.backpack_position + self.lighter_position) > self.absolute_exposure_limit:
                     self.logger.error(f"❌ Position diff is too large: {self.backpack_position + self.lighter_position}")
                     self.trigger_circuit_breaker(f"Hard exposure breached in sell loop: {self.backpack_position + self.lighter_position}")
                     raise RuntimeError("Hard exposure breach")
@@ -1545,7 +1604,8 @@ class HedgeBot:
                             "sell_trade_completion_timeout",
                             force=True
                         )
-                        break
+                        start_time = time.time()
+                        await asyncio.sleep(self.lighter_timeout_retry_sleep_seconds)
                 
                 if exit_after_next_trade:
                     self.logger.info("Position back to zero. Done! Exiting...")
