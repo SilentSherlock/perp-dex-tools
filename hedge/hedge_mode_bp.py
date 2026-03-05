@@ -88,6 +88,9 @@ class HedgeBot:
             self._safe_decimal_env('HEDGE_ALIGNMENT_RETRY_SLEEP_SEC', Decimal('0.1'))
         )
         self.hedge_alignment_force_on_timeout = self._safe_bool_env('HEDGE_ALIGNMENT_FORCE_ON_TIMEOUT', True)
+        self.requote_price_drift_ticks = max(Decimal('1'), self._safe_decimal_env('HEDGE_REQUOTE_DRIFT_TICKS', Decimal('2')))
+        self.requote_min_age_seconds = float(self._safe_decimal_env('HEDGE_REQUOTE_MIN_AGE_SEC', Decimal('0.8')))
+        self.requote_secondary_timeout_seconds = float(self._safe_decimal_env('HEDGE_REQUOTE_SECONDARY_TIMEOUT_SEC', Decimal('0')))
         self.soft_exposure_limit = self.order_quantity * max(Decimal('1'), self._safe_decimal_env('HEDGE_SOFT_EXPOSURE_MULTIPLIER', Decimal('1.5')))
         self.hard_exposure_limit = self.order_quantity * max(Decimal('1'), self._safe_decimal_env('HEDGE_HARD_EXPOSURE_MULTIPLIER', Decimal('2')))
         if self.soft_exposure_limit > self.hard_exposure_limit:
@@ -186,6 +189,7 @@ class HedgeBot:
         self.waiting_for_lighter_fill = False
         self.wait_start_time = None
         self.circuit_breaker_triggered = False
+        self.last_requote_reason = ""
 
         # Order execution tracking
         self.order_execution_complete = False
@@ -235,6 +239,22 @@ class HedgeBot:
         else:
             print(f"Warning: invalid bool env {key}={raw}, fallback to {default}")
         return default
+
+    def log_execution_control_config(self):
+        self.logger.info(
+            "Execution controls: "
+            f"pre_trade_alignment={self.pre_trade_alignment_enabled}, "
+            f"pre_trade_max_basis_bps={self.pre_trade_max_basis_bps}, "
+            f"pre_trade_wait={self.pre_trade_wait_timeout_seconds}s, "
+            f"hedge_alignment={self.hedge_alignment_enabled}, "
+            f"hedge_align_init={self.hedge_alignment_initial_bps}bps, "
+            f"hedge_align_max={self.hedge_alignment_max_bps}bps, "
+            f"hedge_align_wait={self.hedge_alignment_wait_timeout_seconds}s, "
+            f"hedge_force_on_timeout={self.hedge_alignment_force_on_timeout}, "
+            f"requote_drift_ticks={self.requote_price_drift_ticks}, "
+            f"requote_min_age={self.requote_min_age_seconds}s, "
+            f"requote_secondary_timeout={self.get_secondary_requote_timeout()}s"
+        )
 
     def trigger_circuit_breaker(self, reason: str):
         """Trigger a controlled stop when critical hedging risk is detected."""
@@ -862,6 +882,7 @@ class HedgeBot:
         reference_price = self.backpack_best_ask if side.lower() == "buy" else self.backpack_best_bid
         lighter_side = "sell" if side.lower() == "buy" else "buy"
         start_time = time.time()
+        last_log_time = 0.0
         basis_bps = Decimal("0")
         while not self.stop_flag:
             best_bid, best_ask = self.get_lighter_best_levels()
@@ -872,6 +893,13 @@ class HedgeBot:
                     return True
                 if basis_bps >= self.wide_basis_bps:
                     self.publish_risk_event(RiskEvent.BASIS_WIDE, f"basis_bps={basis_bps:.2f}")
+                now = time.time()
+                if now - last_log_time >= 1.0:
+                    self.logger.info(
+                        f"[PRE-ALIGN] side={side} basis={basis_bps:.2f}bps "
+                        f"threshold={self.pre_trade_max_basis_bps}bps"
+                    )
+                    last_log_time = now
             if time.time() - start_time >= self.pre_trade_wait_timeout_seconds:
                 self.logger.info(
                     f"Skip maker leg due to pre-trade basis: side={side}, "
@@ -886,6 +914,7 @@ class HedgeBot:
         if not self.hedge_alignment_enabled:
             return True
         start_time = time.time()
+        last_log_time = 0.0
         latest_basis_bps = Decimal("0")
         latest_threshold_bps = self.hedge_alignment_initial_bps
         while not self.stop_flag:
@@ -901,6 +930,13 @@ class HedgeBot:
                     return True
                 if latest_basis_bps >= self.wide_basis_bps:
                     self.publish_risk_event(RiskEvent.BASIS_WIDE, f"basis_bps={latest_basis_bps:.2f}")
+                now = time.time()
+                if now - last_log_time >= 1.0:
+                    self.logger.info(
+                        f"[HEDGE-ALIGN] side={lighter_side} basis={latest_basis_bps:.2f}bps "
+                        f"threshold={latest_threshold_bps:.2f}bps"
+                    )
+                    last_log_time = now
             if time.time() - start_time >= self.hedge_alignment_wait_timeout_seconds:
                 self.logger.warning(
                     f"Basis alignment timeout: basis={latest_basis_bps:.2f}bps threshold={latest_threshold_bps:.2f}bps "
@@ -949,17 +985,51 @@ class HedgeBot:
                 return 12.0
         return 9.0
 
+    def get_secondary_requote_timeout(self) -> float:
+        if self.requote_secondary_timeout_seconds > 0:
+            return self.requote_secondary_timeout_seconds
+        return self.get_dynamic_requote_timeout()
+
     async def should_requote_backpack_order(self, side: str, order_price: Optional[Decimal], start_time: float) -> bool:
+        elapsed = time.time() - start_time
+        secondary_timeout = self.get_secondary_requote_timeout()
         if order_price is None:
-            return time.time() - start_time > self.get_dynamic_requote_timeout()
-        if time.time() - start_time > self.get_dynamic_requote_timeout():
+            if elapsed > secondary_timeout:
+                self.last_requote_reason = f"time_only elapsed={elapsed:.2f}s>{secondary_timeout:.2f}s"
+                return True
+            return False
+        if elapsed > secondary_timeout:
+            self.last_requote_reason = f"time_fallback elapsed={elapsed:.2f}s>{secondary_timeout:.2f}s"
             return True
         if self.backpack_best_bid is None or self.backpack_best_ask is None or self.backpack_tick_size is None:
+            self.last_requote_reason = "price_check_unavailable"
             return False
-        price_drift_ticks = Decimal('2') * self.backpack_tick_size
+
+        price_drift_ticks = self.requote_price_drift_ticks * self.backpack_tick_size
+        drift_triggered = False
+        drift_size = Decimal('0')
         if side.lower() == 'buy':
-            return (self.backpack_best_ask - order_price) > price_drift_ticks
-        return (order_price - self.backpack_best_bid) > price_drift_ticks
+            drift_size = self.backpack_best_ask - order_price
+            drift_triggered = drift_size > price_drift_ticks
+        else:
+            drift_size = order_price - self.backpack_best_bid
+            drift_triggered = drift_size > price_drift_ticks
+
+        if drift_triggered and elapsed >= self.requote_min_age_seconds:
+            self.last_requote_reason = (
+                f"price_drift drift={drift_size} threshold={price_drift_ticks} elapsed={elapsed:.2f}s"
+            )
+            return True
+
+        if drift_triggered:
+            self.last_requote_reason = (
+                f"price_drift_wait drift={drift_size} threshold={price_drift_ticks} elapsed={elapsed:.2f}s"
+            )
+        else:
+            self.last_requote_reason = (
+                f"hold drift={drift_size} threshold={price_drift_ticks} elapsed={elapsed:.2f}s"
+            )
+        return False
 
     async def process_pending_lighter_hedges(self):
         """Execute queued hedge legs in FIFO order."""
@@ -1086,6 +1156,7 @@ class HedgeBot:
             elif self.backpack_order_status in ['NEW', 'OPEN', 'PENDING', 'CANCELING', 'PARTIALLY_FILLED']:
                 await asyncio.sleep(0.5)
                 if await self.should_requote_backpack_order(side, order_price, start_time):
+                    self.logger.info(f"🔁 Requote Backpack order: side={side}, reason={self.last_requote_reason}")
                     try:
                         # Cancel the order using Backpack client
                         cancel_result = await self.backpack_client.cancel_order(order_id)
@@ -1563,6 +1634,7 @@ class HedgeBot:
             return
 
         await asyncio.sleep(5)
+        self.log_execution_control_config()
 
         iterations = 0
         self.lighter_position = self.get_lighter_position()

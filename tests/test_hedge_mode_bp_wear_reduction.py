@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import sys
 import types
+import time
 from decimal import Decimal
 
 
@@ -84,6 +85,11 @@ def _make_bot():
     bot.pre_trade_retry_sleep_seconds = 0.01
     bot.backpack_best_bid = Decimal("99.9")
     bot.backpack_best_ask = Decimal("100.1")
+    bot.backpack_tick_size = Decimal("0.1")
+    bot.requote_price_drift_ticks = Decimal("2")
+    bot.requote_min_age_seconds = 0.8
+    bot.requote_secondary_timeout_seconds = 0
+    bot.last_requote_reason = ""
     return bot
 
 
@@ -209,3 +215,22 @@ def test_wait_for_pre_trade_alignment_returns_true_when_basis_in_threshold():
     bot.get_lighter_best_levels = lambda: ((Decimal("100.0"), Decimal("1")), (Decimal("100.2"), Decimal("1")))
     result = asyncio.run(bot.wait_for_pre_trade_alignment("buy"))
     assert result is True
+
+
+def test_should_requote_prefers_price_drift_over_time():
+    bot = _make_bot()
+    # buy order price stale by 0.5, threshold=0.2
+    start = time.time() - 1.0
+    should = asyncio.run(bot.should_requote_backpack_order("buy", Decimal("99.6"), start))
+    assert should is True
+    assert "price_drift" in bot.last_requote_reason
+
+
+def test_should_requote_uses_time_as_secondary_fallback():
+    bot = _make_bot()
+    bot.requote_secondary_timeout_seconds = 0.5
+    # no drift: order close to ask, but too old
+    start = time.time() - 1.0
+    should = asyncio.run(bot.should_requote_backpack_order("buy", Decimal("100.0"), start))
+    assert should is True
+    assert "time_fallback" in bot.last_requote_reason
