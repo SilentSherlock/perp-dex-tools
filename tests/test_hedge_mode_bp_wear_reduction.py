@@ -60,6 +60,14 @@ def _make_bot():
     bot.lighter_position = Decimal("0")
     bot.pending_lighter_hedges = []
     bot.waiting_for_lighter_fill = False
+    bot.order_quantity = Decimal("0.02")
+    bot.backpack_min_quantity = Decimal("0.01")
+    bot.event_cooldown_seconds = 0.0
+    bot._last_event_time = {}
+    bot.state_changed_at = 0.0
+    risk_state = importlib.import_module("hedge.hedge_mode_bp").RiskState
+    bot.risk_state = risk_state.NORMAL
+    bot.wide_basis_bps = Decimal("25")
     return bot
 
 
@@ -92,7 +100,8 @@ def test_check_exposure_limits_soft_limit_throttles(monkeypatch):
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
     result = asyncio.run(bot.check_exposure_limits())
     assert result is False
-    assert sleep_calls == [1]
+    assert len(sleep_calls) == 1
+    assert sleep_calls[0] >= 1
     assert bot.stop_flag is False
 
 
@@ -109,6 +118,31 @@ def test_check_exposure_limits_hard_limit_triggers_circuit_breaker():
 
     assert bot.circuit_breaker_triggered is True
     assert bot.stop_flag is True
+
+
+def test_basis_events_switch_risk_state():
+    module = importlib.import_module("hedge.hedge_mode_bp")
+    bot = _make_bot()
+    bot.publish_risk_event(module.RiskEvent.BASIS_WIDE, "wide")
+    assert bot.risk_state == module.RiskState.WIDE
+    bot.publish_risk_event(module.RiskEvent.BASIS_NORMAL, "normal", force=True)
+    assert bot.risk_state == module.RiskState.NORMAL
+
+
+def test_trade_timeout_event_triggers_circuit_breaker():
+    module = importlib.import_module("hedge.hedge_mode_bp")
+    bot = _make_bot()
+    bot.publish_risk_event(module.RiskEvent.TRADE_COMPLETION_TIMEOUT, "timeout", force=True)
+    assert bot.circuit_breaker_triggered is True
+
+
+def test_wide_state_quantity_respects_backpack_minimum():
+    module = importlib.import_module("hedge.hedge_mode_bp")
+    bot = _make_bot()
+    bot.risk_state = module.RiskState.WIDE
+    # requested 0.015 -> wide half => 0.0075, should clamp to 0.01 min quantity
+    adjusted = bot.get_state_adjusted_order_quantity(Decimal("0.015"))
+    assert adjusted == Decimal("0.01")
 
 
 def test_process_pending_lighter_hedges_drains_queue():

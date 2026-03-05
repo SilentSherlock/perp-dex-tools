@@ -11,6 +11,7 @@ import traceback
 import csv
 from decimal import Decimal
 from typing import Tuple, Optional, Dict, Any, List
+from enum import Enum
 
 from lighter.signer_client import SignerClient
 import sys
@@ -27,6 +28,24 @@ class Config:
     def __init__(self, config_dict):
         for key, value in config_dict.items():
             setattr(self, key, value)
+
+
+class RiskState(Enum):
+    NORMAL = "normal"
+    WIDE = "wide"
+    STRESSED = "stressed"
+
+
+class RiskEvent(Enum):
+    MARKET_DATA_UNHEALTHY = "market_data_unhealthy"
+    MARKET_DATA_RECOVERED = "market_data_recovered"
+    BASIS_WIDE = "basis_wide"
+    BASIS_NORMAL = "basis_normal"
+    SOFT_EXPOSURE_BREACH = "soft_exposure_breach"
+    HARD_EXPOSURE_BREACH = "hard_exposure_breach"
+    LIGHTER_HEDGE_TIMEOUT = "lighter_hedge_timeout"
+    LIGHTER_HEDGE_ERROR = "lighter_hedge_error"
+    TRADE_COMPLETION_TIMEOUT = "trade_completion_timeout"
 
 
 class HedgeBot:
@@ -52,6 +71,11 @@ class HedgeBot:
         self.hard_exposure_limit = self.order_quantity * max(Decimal('1'), self._safe_decimal_env('HEDGE_HARD_EXPOSURE_MULTIPLIER', Decimal('2')))
         if self.soft_exposure_limit > self.hard_exposure_limit:
             self.soft_exposure_limit = self.hard_exposure_limit
+        self.event_cooldown_seconds = float(self._safe_decimal_env('HEDGE_EVENT_COOLDOWN_SEC', Decimal('1')))
+        self.wide_basis_bps = max(self.max_basis_bps, self._safe_decimal_env('HEDGE_WIDE_BASIS_BPS', Decimal('25')))
+        self.state_changed_at = time.time()
+        self.risk_state = RiskState.NORMAL
+        self._last_event_time: Dict[str, float] = {}
 
         # Initialize logging to file
         os.makedirs("logs", exist_ok=True)
@@ -158,6 +182,7 @@ class HedgeBot:
         # Backpack configuration
         self.backpack_public_key = os.getenv('BACKPACK_PUBLIC_KEY')
         self.backpack_secret_key = os.getenv('BACKPACK_SECRET_KEY')
+        self.backpack_min_quantity = Decimal('0')
 
     def _safe_decimal_env(self, key: str, default: Decimal) -> Decimal:
         raw = os.getenv(key)
@@ -178,7 +203,80 @@ class HedgeBot:
             return
         self.circuit_breaker_triggered = True
         self.stop_flag = True
+        self.transition_risk_state(RiskState.STRESSED, reason)
         self.logger.error(f"🚨 Circuit breaker triggered: {reason}")
+
+    def transition_risk_state(self, next_state: RiskState, reason: str):
+        """State machine transition helper."""
+        if self.risk_state == next_state:
+            return
+        prev_state = self.risk_state
+        self.risk_state = next_state
+        self.state_changed_at = time.time()
+        self.logger.warning(f"Risk state transition: {prev_state.value} -> {next_state.value}, reason={reason}")
+
+    def _event_on_cooldown(self, event: RiskEvent) -> bool:
+        now = time.time()
+        last = self._last_event_time.get(event.value)
+        if last is None:
+            self._last_event_time[event.value] = now
+            return False
+        if now - last < self.event_cooldown_seconds:
+            return True
+        self._last_event_time[event.value] = now
+        return False
+
+    def publish_risk_event(self, event: RiskEvent, detail: str = "", force: bool = False):
+        """Event-driven risk entrypoint."""
+        if not force and self._event_on_cooldown(event):
+            return
+
+        if event == RiskEvent.MARKET_DATA_UNHEALTHY:
+            self.transition_risk_state(RiskState.STRESSED, detail or "market_data_unhealthy")
+        elif event == RiskEvent.MARKET_DATA_RECOVERED:
+            if self.risk_state == RiskState.STRESSED and not self.circuit_breaker_triggered:
+                self.transition_risk_state(RiskState.NORMAL, detail or "market_data_recovered")
+        elif event == RiskEvent.BASIS_WIDE:
+            if self.risk_state == RiskState.NORMAL:
+                self.transition_risk_state(RiskState.WIDE, detail or "basis_wide")
+        elif event == RiskEvent.BASIS_NORMAL:
+            if self.risk_state == RiskState.WIDE:
+                self.transition_risk_state(RiskState.NORMAL, detail or "basis_normal")
+        elif event == RiskEvent.SOFT_EXPOSURE_BREACH:
+            self.transition_risk_state(RiskState.WIDE, detail or "soft_exposure")
+        elif event in [
+            RiskEvent.HARD_EXPOSURE_BREACH,
+            RiskEvent.LIGHTER_HEDGE_TIMEOUT,
+            RiskEvent.LIGHTER_HEDGE_ERROR,
+            RiskEvent.TRADE_COMPLETION_TIMEOUT,
+        ]:
+            self.trigger_circuit_breaker(detail or event.value)
+
+    def get_state_adjusted_sleep_seconds(self) -> float:
+        if self.risk_state == RiskState.STRESSED:
+            return 2.0
+        if self.risk_state == RiskState.WIDE:
+            return 0.5
+        return 0.0
+
+    def get_state_adjusted_order_quantity(self, requested_qty: Decimal) -> Decimal:
+        if requested_qty <= 0:
+            return Decimal('0')
+        if self.risk_state == RiskState.WIDE:
+            reduced = requested_qty / Decimal("2")
+            if reduced >= self.order_quantity / Decimal("10"):
+                requested_qty = reduced
+        return self.normalize_backpack_order_quantity(requested_qty)
+
+    def normalize_backpack_order_quantity(self, requested_qty: Decimal, allow_skip: bool = False) -> Decimal:
+        if requested_qty <= 0:
+            return Decimal('0')
+        min_qty = self.backpack_min_quantity if self.backpack_min_quantity else Decimal('0')
+        if min_qty > 0 and requested_qty < min_qty:
+            if allow_skip:
+                return Decimal('0')
+            return min_qty
+        return requested_qty
 
     def shutdown(self, signum=None, frame=None):
         """Graceful shutdown handler."""
@@ -443,6 +541,7 @@ class HedgeBot:
                                     self.update_lighter_order_book("asks", asks)
                                     self.lighter_snapshot_loaded = True
                                     self.lighter_order_book_ready = True
+                                    self.publish_risk_event(RiskEvent.MARKET_DATA_RECOVERED, "lighter_snapshot_loaded")
 
                                     self.logger.info(f"✅ Lighter order book snapshot loaded with "
                                                      f"{len(self.lighter_order_book['bids'])} bids and "
@@ -461,6 +560,7 @@ class HedgeBot:
                                     if not self.validate_order_book_offset(new_offset):
                                         self.lighter_order_book_sequence_gap = True
                                         self.lighter_order_book_ready = False
+                                        self.publish_risk_event(RiskEvent.MARKET_DATA_UNHEALTHY, "lighter_sequence_gap")
                                         break
 
                                     # Update the order book with new data
@@ -470,6 +570,7 @@ class HedgeBot:
                                     # Validate order book integrity after update
                                     if not self.validate_order_book_integrity():
                                         self.lighter_order_book_ready = False
+                                        self.publish_risk_event(RiskEvent.MARKET_DATA_UNHEALTHY, "lighter_book_integrity_failed")
                                         self.logger.warning("🔄 Order book integrity check failed, requesting fresh snapshot...")
                                         break
 
@@ -616,6 +717,19 @@ class HedgeBot:
             raise Exception("Backpack client not initialized")
 
         contract_id, tick_size = await self.backpack_client.get_contract_attributes()
+        self.backpack_min_quantity = Decimal('0')
+        try:
+            markets = self.backpack_client.public_client.get_markets()
+            for market in markets:
+                if market.get('symbol', '') == contract_id:
+                    self.backpack_min_quantity = Decimal(
+                        market.get('filters', {}).get('quantity', {}).get('minQuantity', '0')
+                    )
+                    break
+            if self.backpack_min_quantity > 0:
+                self.logger.info(f"Backpack min quantity loaded: {self.backpack_min_quantity}")
+        except Exception as e:
+            self.logger.warning(f"⚠️ Failed to fetch Backpack min quantity: {e}")
 
         if self.order_quantity < self.backpack_client.config.quantity:
             raise ValueError(
@@ -659,7 +773,12 @@ class HedgeBot:
         mid = (best_bid + best_ask) / Decimal('2')
         spread_ratio = (best_ask - best_bid) / mid if mid > 0 else Decimal('0')
         dynamic_slippage = self.base_lighter_slippage + (spread_ratio * Decimal('2'))
-        return min(self.max_lighter_slippage, max(self.base_lighter_slippage, dynamic_slippage))
+        bounded_slippage = min(self.max_lighter_slippage, max(self.base_lighter_slippage, dynamic_slippage))
+        if self.risk_state == RiskState.WIDE:
+            return min(bounded_slippage, self.max_lighter_slippage * Decimal('0.7'))
+        if self.risk_state == RiskState.STRESSED:
+            return self.max_lighter_slippage
+        return bounded_slippage
 
     def compute_lighter_aggressive_price(self, lighter_side: str, best_bid: Decimal, best_ask: Decimal) -> Decimal:
         """Get aggressive but capped price for Lighter hedge leg."""
@@ -696,7 +815,10 @@ class HedgeBot:
                 hedge_reference = best_ask[0] if lighter_side.lower() == 'buy' else best_bid[0]
                 basis_bps = self.calculate_basis_bps(reference_price, hedge_reference)
                 if basis_bps <= self.max_basis_bps:
+                    self.publish_risk_event(RiskEvent.BASIS_NORMAL, f"basis_bps={basis_bps:.2f}")
                     return True
+                if basis_bps >= self.wide_basis_bps:
+                    self.publish_risk_event(RiskEvent.BASIS_WIDE, f"basis_bps={basis_bps:.2f}")
             if time.time() - start_time >= self.basis_wait_timeout:
                 return False
             await asyncio.sleep(0.1)
@@ -717,15 +839,21 @@ class HedgeBot:
         start = time.time()
         while not self.stop_flag:
             if self.is_market_data_healthy():
+                self.publish_risk_event(RiskEvent.MARKET_DATA_RECOVERED, "market_data_healthy")
                 return True
             if time.time() - start > timeout:
                 self.logger.warning("⚠️ Market data not healthy within timeout, skip this cycle")
+                self.publish_risk_event(RiskEvent.MARKET_DATA_UNHEALTHY, "health_timeout")
                 return False
             await asyncio.sleep(0.5)
         return False
 
     def get_dynamic_requote_timeout(self) -> float:
         """Adaptive timeout for maker order cancel/requote."""
+        if self.risk_state == RiskState.STRESSED:
+            return 4.0
+        if self.risk_state == RiskState.WIDE:
+            return 12.0
         if self.backpack_best_bid and self.backpack_best_ask and self.backpack_best_ask > self.backpack_best_bid:
             mid = (self.backpack_best_bid + self.backpack_best_ask) / Decimal('2')
             spread_ratio = (self.backpack_best_ask - self.backpack_best_bid) / mid if mid > 0 else Decimal('0')
@@ -762,15 +890,21 @@ class HedgeBot:
         """Apply soft/hard exposure controls."""
         net_exposure = abs(self.backpack_position + self.lighter_position)
         if net_exposure > self.hard_exposure_limit:
-            self.trigger_circuit_breaker(
-                f"Hard exposure breached: {net_exposure} > {self.hard_exposure_limit}"
+            self.publish_risk_event(
+                RiskEvent.HARD_EXPOSURE_BREACH,
+                f"net_exposure={net_exposure} hard_limit={self.hard_exposure_limit}",
+                force=True
             )
             raise RuntimeError("Hard exposure limit breached")
         if net_exposure > self.soft_exposure_limit:
+            self.publish_risk_event(
+                RiskEvent.SOFT_EXPOSURE_BREACH,
+                f"net_exposure={net_exposure} soft_limit={self.soft_exposure_limit}"
+            )
             self.logger.warning(
                 f"⚠️ Soft exposure warning: {net_exposure} > {self.soft_exposure_limit}, throttling..."
             )
-            await asyncio.sleep(1)
+            await asyncio.sleep(1 + self.get_state_adjusted_sleep_seconds())
             return False
         return True
 
@@ -920,6 +1054,7 @@ class HedgeBot:
 
         best_bid, best_ask = self.get_lighter_best_levels()
         if best_bid is None or best_ask is None:
+            self.publish_risk_event(RiskEvent.LIGHTER_HEDGE_ERROR, "missing_lighter_bbo")
             self.trigger_circuit_breaker("Lighter best bid/ask unavailable during hedge")
             raise RuntimeError("Missing Lighter order book for hedge")
 
@@ -937,6 +1072,7 @@ class HedgeBot:
             )
             best_bid, best_ask = self.get_lighter_best_levels()
             if best_bid is None or best_ask is None:
+                self.publish_risk_event(RiskEvent.LIGHTER_HEDGE_ERROR, "missing_lighter_bbo_after_basis_wait")
                 self.trigger_circuit_breaker("Lighter best bid/ask missing after basis wait")
                 raise RuntimeError("Missing Lighter order book after basis wait")
         price = self.compute_lighter_aggressive_price(lighter_side, best_bid[0], best_ask[0])
@@ -974,6 +1110,7 @@ class HedgeBot:
             return tx_hash
         except Exception as e:
             self.logger.error(f"❌ Error placing Lighter order: {e}")
+            self.publish_risk_event(RiskEvent.LIGHTER_HEDGE_ERROR, f"lighter_place_error={e}", force=True)
             self.trigger_circuit_breaker(f"Lighter hedge placement failed: {e}")
             raise
 
@@ -988,6 +1125,11 @@ class HedgeBot:
                 self.logger.error(f"❌ Order state - Filled: {self.lighter_order_filled}")
 
                 # Hard stop on timeout to avoid fake hedging
+                self.publish_risk_event(
+                    RiskEvent.LIGHTER_HEDGE_TIMEOUT,
+                    f"order_id={client_order_index}",
+                    force=True
+                )
                 self.trigger_circuit_breaker(f"Lighter hedge timeout for order {client_order_index}")
                 raise TimeoutError(f"Lighter order timeout: {client_order_index}")
 
@@ -1292,6 +1434,9 @@ class HedgeBot:
                     continue
                 if not await self.check_exposure_limits():
                     continue
+                if self.risk_state == RiskState.STRESSED:
+                    await asyncio.sleep(self.get_state_adjusted_sleep_seconds())
+                    continue
                 if abs(self.backpack_position + self.lighter_position) > self.hard_exposure_limit:
                     self.logger.error(f"❌ Position diff is too large: {self.backpack_position + self.lighter_position}")
                     self.trigger_circuit_breaker(f"Hard exposure breached in buy loop: {self.backpack_position + self.lighter_position}")
@@ -1304,10 +1449,15 @@ class HedgeBot:
                 try:
                     # Determine side based on some logic (for now, alternate)
                     side = 'buy'
-                    await self.place_backpack_post_only_order(side, self.order_quantity)
+                    maker_quantity = self.get_state_adjusted_order_quantity(self.order_quantity)
+                    if maker_quantity <= 0:
+                        self.logger.warning("⚠️ Buy maker quantity is zero after normalization, skip this cycle")
+                        continue
+                    await self.place_backpack_post_only_order(side, maker_quantity)
                 except Exception as e:
                     self.logger.error(f"⚠️ Error in trading loop: {e}")
                     self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
+                    self.publish_risk_event(RiskEvent.LIGHTER_HEDGE_ERROR, f"buy_loop_error={e}", force=True)
                     self.trigger_circuit_breaker(f"Buy loop failed: {e}")
                     break
 
@@ -1320,7 +1470,11 @@ class HedgeBot:
 
                     await asyncio.sleep(0.01)
                     if time.time() - start_time > 180:
-                        self.trigger_circuit_breaker("Timeout waiting for buy trade completion")
+                        self.publish_risk_event(
+                            RiskEvent.TRADE_COMPLETION_TIMEOUT,
+                            "buy_trade_completion_timeout",
+                            force=True
+                        )
                         break
 
                 if self.stop_flag:
@@ -1328,7 +1482,7 @@ class HedgeBot:
 
             if self.sleep_time > 0:
                 self.logger.info(f"💤 Sleeping {self.sleep_time} seconds ...")
-                await asyncio.sleep(self.sleep_time)
+                await asyncio.sleep(self.sleep_time + self.get_state_adjusted_sleep_seconds())
 
             exit_after_next_trade = False
             while self.backpack_position > -1*self.max_position and not self.stop_flag:
@@ -1338,6 +1492,9 @@ class HedgeBot:
                 if not await self.wait_for_market_data_health():
                     continue
                 if not await self.check_exposure_limits():
+                    continue
+                if self.risk_state == RiskState.STRESSED:
+                    await asyncio.sleep(self.get_state_adjusted_sleep_seconds())
                     continue
                 if abs(self.backpack_position + self.lighter_position) > self.hard_exposure_limit:
                     self.logger.error(f"❌ Position diff is too large: {self.backpack_position + self.lighter_position}")
@@ -1356,12 +1513,23 @@ class HedgeBot:
                     # Determine side based on some logic (for now, alternate)
                     side = 'sell'
                     if exit_after_next_trade:
-                        await self.place_backpack_post_only_order(side, abs(self.backpack_position))
+                        exit_quantity = self.normalize_backpack_order_quantity(abs(self.backpack_position), allow_skip=True)
+                        if exit_quantity <= 0:
+                            self.logger.warning(
+                                f"⚠️ Residual position {self.backpack_position} below min quantity {self.backpack_min_quantity}, stop graceful exit"
+                            )
+                            break
+                        await self.place_backpack_post_only_order(side, exit_quantity)
                     else:
-                        await self.place_backpack_post_only_order(side, self.order_quantity)
+                        maker_quantity = self.get_state_adjusted_order_quantity(self.order_quantity)
+                        if maker_quantity <= 0:
+                            self.logger.warning("⚠️ Sell maker quantity is zero after normalization, skip this cycle")
+                            continue
+                        await self.place_backpack_post_only_order(side, maker_quantity)
                 except Exception as e:
                     self.logger.error(f"⚠️ Error in trading loop: {e}")
                     self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
+                    self.publish_risk_event(RiskEvent.LIGHTER_HEDGE_ERROR, f"sell_loop_error={e}", force=True)
                     break
 
                 while not self.order_execution_complete and not self.stop_flag:
@@ -1372,7 +1540,11 @@ class HedgeBot:
 
                     await asyncio.sleep(0.01)
                     if time.time() - start_time > 180:
-                        self.trigger_circuit_breaker("Timeout waiting for sell trade completion")
+                        self.publish_risk_event(
+                            RiskEvent.TRADE_COMPLETION_TIMEOUT,
+                            "sell_trade_completion_timeout",
+                            force=True
+                        )
                         break
                 
                 if exit_after_next_trade:
