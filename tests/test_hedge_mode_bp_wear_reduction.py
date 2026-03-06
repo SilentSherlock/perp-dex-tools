@@ -258,3 +258,42 @@ def test_monitor_lighter_order_exits_on_terminal_failure():
     bot.lighter_order_failure_reason = "order_canceled"
     result = asyncio.run(bot.monitor_lighter_order(123))
     assert result is False
+
+
+def test_netting_buffer_nets_opposite_fills_and_uses_vwap():
+    module = importlib.import_module("hedge.hedge_mode_bp")
+    buf = module.HedgeNettingBuffer()
+
+    # BP buy fill => lighter_side 'sell'
+    buf.add_fill("sell", Decimal("0.02"), Decimal("100"))
+    # BP sell fill => lighter_side 'buy' (nets out 0.01)
+    buf.add_fill("buy", Decimal("0.01"), Decimal("102"))
+
+    order = buf.pop_next_order()
+    assert order is not None
+    side, qty, vwap = order
+    assert side == "sell"
+    assert qty == Decimal("0.01")
+    assert vwap == Decimal("100")
+
+
+def test_netting_buffer_instances_do_not_share_state():
+    module = importlib.import_module("hedge.hedge_mode_bp")
+    buf1 = module.HedgeNettingBuffer()
+    buf2 = module.HedgeNettingBuffer()
+    buf1.add_fill("sell", Decimal("0.01"), Decimal("100"))
+    assert buf1.has_pending() is True
+    assert buf2.has_pending() is False
+
+
+def test_funding_direction_choice_prefers_higher_net_receive():
+    module = importlib.import_module("hedge.hedge_mode_bp")
+    bot = _make_bot()
+    bot.core_target_abs_position = Decimal("0.5")
+    # BP positive => shorts receive; Lighter negative => longs receive => choose BP short
+    desired = bot.compute_desired_core_bp_target(Decimal("0.0002"), Decimal("-0.0001"))
+    assert desired == Decimal("-0.5")
+
+    # BP negative => longs receive; Lighter positive => shorts receive => choose BP long
+    desired2 = bot.compute_desired_core_bp_target(Decimal("-0.0002"), Decimal("0.0001"))
+    assert desired2 == Decimal("0.5")

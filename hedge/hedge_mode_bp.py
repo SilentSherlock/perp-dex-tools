@@ -12,6 +12,7 @@ import csv
 from decimal import Decimal
 from typing import Tuple, Optional, Dict, Any, List
 from enum import Enum
+from dataclasses import dataclass, field
 
 from lighter.signer_client import SignerClient
 import sys
@@ -47,6 +48,73 @@ class RiskEvent(Enum):
     LIGHTER_HEDGE_ERROR = "lighter_hedge_error"
     TRADE_COMPLETION_TIMEOUT = "trade_completion_timeout"
 
+@dataclass
+class _NetAccumulator:
+    quantity: Decimal = Decimal("0")
+    notional: Decimal = Decimal("0")
+
+    def vwap(self) -> Decimal:
+        if self.quantity <= 0:
+            return Decimal("0")
+        return self.notional / self.quantity
+
+    def remove_proportional(self, remove_qty: Decimal):
+        if remove_qty <= 0 or self.quantity <= 0:
+            return
+        remove_qty = min(remove_qty, self.quantity)
+        avg = self.vwap()
+        self.quantity -= remove_qty
+        self.notional -= avg * remove_qty
+        if self.quantity <= 0:
+            self.quantity = Decimal("0")
+            self.notional = Decimal("0")
+
+
+@dataclass
+class HedgeNettingBuffer:
+    """Accumulates filled maker legs and produces net hedge orders (VWAP reference).
+
+    buy_bucket represents hedges where Lighter side should be 'buy' (e.g., BP sell fills).
+    sell_bucket represents hedges where Lighter side should be 'sell' (e.g., BP buy fills).
+    """
+
+    buy_bucket: _NetAccumulator = field(default_factory=_NetAccumulator)
+    sell_bucket: _NetAccumulator = field(default_factory=_NetAccumulator)
+
+    def add_fill(self, lighter_side: str, quantity: Decimal, reference_price: Decimal):
+        if quantity <= 0 or reference_price <= 0:
+            return
+        bucket = self.buy_bucket if lighter_side.lower() == "buy" else self.sell_bucket
+        bucket.quantity += quantity
+        bucket.notional += quantity * reference_price
+        self._net_internal()
+
+    def _net_internal(self):
+        net_qty = min(self.buy_bucket.quantity, self.sell_bucket.quantity)
+        if net_qty <= 0:
+            return
+        self.buy_bucket.remove_proportional(net_qty)
+        self.sell_bucket.remove_proportional(net_qty)
+
+    def has_pending(self) -> bool:
+        return self.buy_bucket.quantity > 0 or self.sell_bucket.quantity > 0
+
+    def pop_next_order(self) -> Optional[Tuple[str, Decimal, Decimal]]:
+        """Return (lighter_side, qty, vwap_reference_price) and reduce buffer."""
+        if not self.has_pending():
+            return None
+        if self.buy_bucket.quantity >= self.sell_bucket.quantity:
+            side = "buy"
+            bucket = self.buy_bucket
+        else:
+            side = "sell"
+            bucket = self.sell_bucket
+        qty = bucket.quantity
+        px = bucket.vwap()
+        bucket.quantity = Decimal("0")
+        bucket.notional = Decimal("0")
+        return side, qty, px
+
 
 class HedgeBot:
     """Trading bot that places post-only orders on Backpack and hedges with market orders on Lighter."""
@@ -67,6 +135,21 @@ class HedgeBot:
         self.base_lighter_slippage = min(self.max_lighter_slippage, self._safe_decimal_env('HEDGE_BASE_LIGHTER_SLIPPAGE', Decimal('0.0004')))
         self.max_basis_bps = max(Decimal('1'), self._safe_decimal_env('HEDGE_MAX_BASIS_BPS', Decimal('15')))
         self.basis_wait_timeout = float(self._safe_decimal_env('HEDGE_BASIS_WAIT_TIMEOUT_SEC', Decimal('3')))
+        self.strategy = os.getenv("HEDGE_STRATEGY", "legacy").strip().lower() if os.getenv("HEDGE_STRATEGY") else "legacy"
+        self.funding_enabled = self._safe_bool_env("HEDGE_FUNDING_ENABLED", self.strategy == "core_satellite")
+        self.funding_refresh_seconds = float(self._safe_decimal_env("HEDGE_FUNDING_REFRESH_SEC", Decimal("3600")))
+        self.funding_switch_threshold_seconds = float(self._safe_decimal_env("HEDGE_FUNDING_SWITCH_THRESHOLD_SEC", Decimal("3600")))
+        self.funding_ramp_interval_seconds = float(self._safe_decimal_env("HEDGE_FUNDING_RAMP_INTERVAL_SEC", Decimal("60")))
+        self.funding_ramp_step_quantity = self._safe_decimal_env("HEDGE_FUNDING_RAMP_STEP_QTY", self.order_quantity)
+        self.netting_window_seconds = float(self._safe_decimal_env("HEDGE_NETTING_WINDOW_SEC", Decimal("1")))
+        self.satellite_enabled = self._safe_bool_env("HEDGE_SAT_ENABLED", True)
+        self.satellite_order_quantity = self._safe_decimal_env("HEDGE_SAT_ORDER_QTY", self.order_quantity)
+        self.satellite_band = max(Decimal("0"), self._safe_decimal_env("HEDGE_SAT_BAND", self.max_position))
+        self.satellite_max_net_exposure = self.order_quantity * max(Decimal('2'), self._safe_decimal_env("HEDGE_SAT_MAX_NET_EXPOSURE_MULT", Decimal("4")))
+        self.core_target_abs_position = max(Decimal("0"), self._safe_decimal_env("HEDGE_CORE_TARGET_ABS_POSITION", Decimal("0")))
+        self.core_long_exchange = (os.getenv("HEDGE_CORE_LONG_EXCHANGE", "backpack").strip().lower()
+                                   if os.getenv("HEDGE_CORE_LONG_EXCHANGE") else "backpack")
+        self.core_rebalance_interval_seconds = float(self._safe_decimal_env("HEDGE_CORE_REBALANCE_INTERVAL_SEC", Decimal("30")))
         self.pre_trade_alignment_enabled = self._safe_bool_env('HEDGE_PRE_TRADE_ALIGNMENT_ENABLED', False)
         self.pre_trade_max_basis_bps = max(Decimal('0.5'), self._safe_decimal_env('HEDGE_PRE_TRADE_MAX_BASIS_BPS', Decimal('3')))
         self.pre_trade_wait_timeout_seconds = float(self._safe_decimal_env('HEDGE_PRE_TRADE_WAIT_TIMEOUT_SEC', Decimal('1.5')))
@@ -208,9 +291,19 @@ class HedgeBot:
         self.pending_lighter_hedges: List[Dict[str, Any]] = []
         self.backpack_order_hedged_size: Dict[str, Decimal] = {}
         self.lighter_order_contexts: Dict[str, Dict[str, Any]] = {}
+        self.netting_buffer = HedgeNettingBuffer()
+        self.netting_task = None
+        self.current_hedge_component = "legacy"
         self.hedge_stage_stats: Dict[str, Dict[str, Decimal]] = {}
         self.total_hedge_fills = 0
         self._last_hedge_stats_log_time = time.time()
+        self.funding_task = None
+        self.funding_ramp_task = None
+        self.last_backpack_funding_rate = None
+        self.last_lighter_funding_rate = None
+        self.last_backpack_next_funding_ts = None
+        self.last_lighter_next_funding_ts = None
+        self.core_bp_target_live: Optional[Decimal] = None
 
         # Lighter API configuration
         self.lighter_base_url = "https://mainnet.zklighter.elliot.ai"
@@ -266,6 +359,10 @@ class HedgeBot:
     def log_execution_control_config(self):
         self.logger.info(
             "Execution controls: "
+            f"strategy={self.strategy}, "
+            f"funding_enabled={self.funding_enabled}, "
+            f"funding_refresh={self.funding_refresh_seconds}s, "
+            f"funding_switch_threshold={self.funding_switch_threshold_seconds}s, "
             f"pre_trade_alignment={self.pre_trade_alignment_enabled}, "
             f"pre_trade_max_basis_bps={self.pre_trade_max_basis_bps}, "
             f"pre_trade_wait={self.pre_trade_wait_timeout_seconds}s, "
@@ -275,12 +372,219 @@ class HedgeBot:
             f"hedge_align_wait={self.hedge_alignment_wait_timeout_seconds}s, "
             f"hedge_force_on_timeout={self.hedge_alignment_force_on_timeout}, "
             f"lighter_cancel_after={self.lighter_cancel_after_seconds}s, "
+            f"netting_window={self.netting_window_seconds}s, "
+            f"sat_enabled={self.satellite_enabled}, "
+            f"sat_order_qty={self.satellite_order_quantity}, "
+            f"sat_band={self.satellite_band}, "
+            f"sat_max_net_exposure={self.satellite_max_net_exposure}, "
+            f"core_abs_target={self.core_target_abs_position}, "
+            f"core_long_exchange={self.core_long_exchange}, "
             f"requote_drift_ticks={self.requote_price_drift_ticks}, "
             f"requote_min_age={self.requote_min_age_seconds}s, "
             f"requote_secondary_timeout={self.get_secondary_requote_timeout()}s, "
             f"stats_interval={self.hedge_stats_log_interval_seconds}s, "
             f"stats_every_fills={self.hedge_stats_log_every_n_fills}"
         )
+
+    @staticmethod
+    def funding_receive_side(funding_rate: Decimal) -> str:
+        """Return which side receives funding on an exchange for a given rate.
+
+        Assumption (standard perp convention): positive rate => longs pay, shorts receive.
+        """
+        if funding_rate > 0:
+            return "short"
+        if funding_rate < 0:
+            return "long"
+        return "neutral"
+
+    @staticmethod
+    def funding_pnl_per_notional(funding_rate: Decimal, side: str) -> Decimal:
+        side = (side or "").lower()
+        if funding_rate == 0:
+            return Decimal("0")
+        if funding_rate > 0:
+            return funding_rate if side == "short" else -funding_rate
+        # funding_rate < 0: longs receive abs(rate)
+        return (-funding_rate) if side == "long" else funding_rate
+
+    @staticmethod
+    def position_side(position: Decimal) -> str:
+        if position > 0:
+            return "long"
+        if position < 0:
+            return "short"
+        return "flat"
+
+    def seconds_to_next_funding(self) -> Optional[float]:
+        now = time.time()
+        candidates = []
+        if self.last_backpack_next_funding_ts:
+            candidates.append(float(self.last_backpack_next_funding_ts) - now)
+        if self.last_lighter_next_funding_ts:
+            candidates.append(float(self.last_lighter_next_funding_ts) - now)
+        if not candidates:
+            return None
+        return max(0.0, min(candidates))
+
+    def compute_desired_core_bp_target(self, backpack_rate: Decimal, lighter_rate: Decimal) -> Decimal:
+        """Choose which exchange to be long on to maximize funding PnL (per notional) while remaining hedged."""
+        if self.core_target_abs_position <= 0:
+            return Decimal("0")
+        abs_pos = self.core_target_abs_position
+
+        pnl_if_bp_long = self.funding_pnl_per_notional(backpack_rate, "long") + self.funding_pnl_per_notional(lighter_rate, "short")
+        pnl_if_bp_short = self.funding_pnl_per_notional(backpack_rate, "short") + self.funding_pnl_per_notional(lighter_rate, "long")
+        return abs_pos if pnl_if_bp_long >= pnl_if_bp_short else -abs_pos
+
+    def _parse_funding_payload(self, payload: Any, *, symbol: str, market_id: Optional[int] = None) -> Tuple[Decimal, Optional[float]]:
+        """Best-effort parse for funding rate + next timestamp."""
+        def _extract(obj: Dict[str, Any]) -> Optional[Tuple[Decimal, Optional[float]]]:
+            raw_rate = (obj.get("fundingRate") or obj.get("funding_rate") or obj.get("rate") or obj.get("funding"))
+            if raw_rate is None:
+                return None
+            try:
+                rate = Decimal(str(raw_rate))
+            except Exception:
+                return None
+            ts = (
+                obj.get("intervalEndTimestamp")
+                or obj.get("nextFundingTimestamp")
+                or obj.get("next_funding_timestamp")
+                or obj.get("next_funding_time")
+                or obj.get("fundingTime")
+            )
+            next_ts = None
+            if ts is not None:
+                try:
+                    next_ts = float(ts) / 1000.0 if float(ts) > 10_000_000_000 else float(ts)
+                except Exception:
+                    next_ts = None
+            return rate, next_ts
+
+        if isinstance(payload, dict):
+            # common wrappers
+            for key in ("fundingRates", "funding_rates", "data", "result"):
+                if key in payload:
+                    inner = payload.get(key)
+                    parsed = self._parse_funding_payload(inner, symbol=symbol, market_id=market_id)
+                    if parsed[0] is not None:
+                        return parsed
+            # direct object
+            parsed = _extract(payload)
+            if parsed is not None:
+                return parsed
+        if isinstance(payload, list):
+            for obj in payload:
+                if not isinstance(obj, dict):
+                    continue
+                sym = str(obj.get("symbol", obj.get("market", ""))).upper()
+                mid = obj.get("marketId") or obj.get("market_id") or obj.get("market_index") or obj.get("marketIndex")
+                if (sym and sym == symbol.upper()) or (market_id is not None and mid is not None and int(mid) == int(market_id)):
+                    parsed = _extract(obj)
+                    if parsed is not None:
+                        return parsed
+            # fallback: first parseable
+            for obj in payload:
+                if isinstance(obj, dict):
+                    parsed = _extract(obj)
+                    if parsed is not None:
+                        return parsed
+        raise ValueError("Unrecognized funding payload shape")
+
+    def get_backpack_funding(self) -> Tuple[Decimal, Optional[float]]:
+        url = "https://api.backpack.exchange/api/v1/fundingRates"
+        params = {"symbol": self.backpack_contract_id} if self.backpack_contract_id else None
+        headers = {"accept": "application/json", "user-agent": "perp-dex-tools/hedge_mode_bp"}
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        resp.raise_for_status()
+        payload = resp.json()
+        return self._parse_funding_payload(payload, symbol=self.backpack_contract_id)
+
+    def get_lighter_funding(self) -> Tuple[Decimal, Optional[float]]:
+        url = f"{self.lighter_base_url}/api/v1/funding-rates"
+        headers = {"accept": "application/json", "user-agent": "perp-dex-tools/hedge_mode_bp"}
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        payload = resp.json()
+        return self._parse_funding_payload(payload, symbol=self.ticker, market_id=self.lighter_market_index)
+
+    def refresh_funding_or_raise(self):
+        bp_rate, bp_next = self.get_backpack_funding()
+        lt_rate, lt_next = self.get_lighter_funding()
+        self.last_backpack_funding_rate = bp_rate
+        self.last_lighter_funding_rate = lt_rate
+        self.last_backpack_next_funding_ts = bp_next
+        self.last_lighter_next_funding_ts = lt_next
+        self.logger.info(
+            f"[FUNDING] backpack rate={bp_rate} recv={self.funding_receive_side(bp_rate)} next={bp_next} "
+            f"| lighter rate={lt_rate} recv={self.funding_receive_side(lt_rate)} next={lt_next}"
+        )
+
+    async def funding_refresh_loop(self):
+        while not self.stop_flag:
+            try:
+                self.refresh_funding_or_raise()
+            except Exception as e:
+                self.logger.error(f"❌ Funding refresh failed: {e}")
+            await asyncio.sleep(max(60.0, self.funding_refresh_seconds))
+
+    async def funding_ramp_loop(self):
+        while not self.stop_flag:
+            try:
+                if not self.funding_enabled or self.strategy != "core_satellite" or self.core_target_abs_position <= 0:
+                    await asyncio.sleep(10.0)
+                    continue
+                if self.last_backpack_funding_rate is None or self.last_lighter_funding_rate is None:
+                    await asyncio.sleep(10.0)
+                    continue
+
+                seconds_to = self.seconds_to_next_funding()
+                if seconds_to is None or seconds_to > self.funding_switch_threshold_seconds:
+                    await asyncio.sleep(self.funding_ramp_interval_seconds)
+                    continue
+
+                desired = self.compute_desired_core_bp_target(self.last_backpack_funding_rate, self.last_lighter_funding_rate)
+                if self.core_bp_target_live is None:
+                    self.core_bp_target_live = desired
+
+                # Determine whether current BP side is paying funding
+                bp_side = self.position_side(self.backpack_position)
+                bp_recv = self.funding_receive_side(self.last_backpack_funding_rate)
+                paying_bp = (bp_side != "flat" and bp_recv != "neutral" and bp_side != bp_recv)
+
+                lt_side = self.position_side(self.lighter_position)
+                lt_recv = self.funding_receive_side(self.last_lighter_funding_rate)
+                paying_lt = (lt_side != "flat" and lt_recv != "neutral" and lt_side != lt_recv)
+
+                if not (paying_bp or paying_lt):
+                    await asyncio.sleep(self.funding_ramp_interval_seconds)
+                    continue
+
+                step = max(Decimal("0"), self.funding_ramp_step_quantity)
+                if step <= 0:
+                    await asyncio.sleep(self.funding_ramp_interval_seconds)
+                    continue
+
+                delta = desired - self.core_bp_target_live
+                if abs(delta) <= step:
+                    self.core_bp_target_live = desired
+                else:
+                    self.core_bp_target_live += step if delta > 0 else -step
+
+                # Clamp to abs target
+                if self.core_bp_target_live > self.core_target_abs_position:
+                    self.core_bp_target_live = self.core_target_abs_position
+                if self.core_bp_target_live < -self.core_target_abs_position:
+                    self.core_bp_target_live = -self.core_target_abs_position
+
+                self.logger.warning(
+                    f"⚠️ Funding ramp active (t_to_funding={seconds_to:.0f}s): desired_bp_target={desired}, live_bp_target={self.core_bp_target_live}, "
+                    f"paying_bp={paying_bp}, paying_lt={paying_lt}"
+                )
+            except Exception as e:
+                self.logger.error(f"❌ Funding ramp error: {e}")
+            await asyncio.sleep(max(10.0, self.funding_ramp_interval_seconds))
 
     def _ensure_stage_stats(self, stage: str) -> Dict[str, Decimal]:
         if stage not in self.hedge_stage_stats:
@@ -437,6 +741,27 @@ class HedgeBot:
                 self.logger.info("🔌 Lighter WebSocket task cancelled")
             except Exception as e:
                 self.logger.error(f"Error cancelling Lighter WebSocket task: {e}")
+
+        if self.netting_task and not self.netting_task.done():
+            try:
+                self.netting_task.cancel()
+                self.logger.info("🔌 Netting task cancelled")
+            except Exception as e:
+                self.logger.error(f"Error cancelling netting task: {e}")
+
+        if self.funding_task and not self.funding_task.done():
+            try:
+                self.funding_task.cancel()
+                self.logger.info("🔌 Funding task cancelled")
+            except Exception as e:
+                self.logger.error(f"Error cancelling funding task: {e}")
+
+        if self.funding_ramp_task and not self.funding_ramp_task.done():
+            try:
+                self.funding_ramp_task.cancel()
+                self.logger.info("🔌 Funding ramp task cancelled")
+            except Exception as e:
+                self.logger.error(f"Error cancelling funding ramp task: {e}")
 
         # Close logging handlers properly
         for handler in self.logger.handlers[:]:
@@ -1212,6 +1537,15 @@ class HedgeBot:
         self.lighter_position = self.get_lighter_position()
         self.backpack_position = await self.get_backpack_position()
 
+    def get_core_targets(self) -> Tuple[Decimal, Decimal]:
+        if self.core_target_abs_position <= 0:
+            return Decimal("0"), Decimal("0")
+        if self.core_bp_target_live is not None:
+            return self.core_bp_target_live, -self.core_bp_target_live
+        if self.core_long_exchange == "lighter":
+            return -self.core_target_abs_position, self.core_target_abs_position
+        return self.core_target_abs_position, -self.core_target_abs_position
+
     async def smooth_position_gap(self) -> bool:
         """Reduce cross-exchange position gap in chunks of order_quantity."""
         max_smooth_rounds = 50
@@ -1374,6 +1708,11 @@ class HedgeBot:
         else:
             lighter_side = 'buy'
 
+        if self.strategy == "core_satellite":
+            self.netting_buffer.add_fill(lighter_side, filled_size, price)
+            self.waiting_for_lighter_fill = self.netting_buffer.has_pending()
+            return
+
         # Store order details for immediate execution
         self.current_lighter_side = lighter_side
         self.current_lighter_quantity = filled_size
@@ -1387,6 +1726,43 @@ class HedgeBot:
 
         self.pending_lighter_hedges.append(self.lighter_order_info.copy())
         self.waiting_for_lighter_fill = True
+
+    async def flush_netting_buffer(self, force: bool = False, component: str = "sat"):
+        if self.strategy != "core_satellite":
+            return
+        if not self.netting_buffer.has_pending():
+            self.waiting_for_lighter_fill = False
+            return
+        if self.active_lighter_client_order_id:
+            return
+        order = self.netting_buffer.pop_next_order()
+        if order is None:
+            self.waiting_for_lighter_fill = False
+            return
+        lighter_side, quantity, reference_price = order
+        if quantity <= 0 or reference_price <= 0:
+            return
+
+        prev_component = self.current_hedge_component
+        self.current_hedge_component = component or "sat"
+        try:
+            result = await self.place_lighter_market_order(lighter_side, quantity, reference_price)
+            if result is None:
+                # put back into buffer (best-effort)
+                self.netting_buffer.add_fill(lighter_side, quantity, reference_price)
+        finally:
+            self.current_hedge_component = prev_component
+            self.waiting_for_lighter_fill = self.netting_buffer.has_pending()
+
+    async def run_netting_loop(self):
+        if self.strategy != "core_satellite":
+            return
+        while not self.stop_flag:
+            try:
+                await self.flush_netting_buffer(force=False, component="sat")
+            except Exception as e:
+                self.logger.error(f"❌ Netting loop error: {e}")
+            await asyncio.sleep(max(0.05, self.netting_window_seconds))
 
     async def cancel_lighter_order(self, client_order_index: int) -> bool:
         """Cancel active Lighter order by client order index."""
@@ -1486,8 +1862,9 @@ class HedgeBot:
                 raise Exception(f"Error placing Lighter order: {error}")
 
             slippage_bps = self.compute_lighter_slippage(best_bid[0], best_ask[0]) * Decimal('10000')
+            stage_tag = f"{self.current_hedge_component}.{hedge_stage}" if self.current_hedge_component else hedge_stage
             self.lighter_order_contexts[str(client_order_index)] = {
-                "stage": hedge_stage,
+                "stage": stage_tag,
                 "reference_price": reference_price,
                 "reference_quantity": quantity,
                 "basis_bps": alignment_info.get("basis_bps", Decimal("0")),
@@ -1496,7 +1873,7 @@ class HedgeBot:
             }
             self.logger.info(
                 f"[{client_order_index}] [{order_type}] [Lighter] [OPEN]: {normalized_quantity} @ {normalized_price} "
-                f"(slippage={slippage_bps:.2f}bps, stage={hedge_stage}, "
+                f"(slippage={slippage_bps:.2f}bps, stage={stage_tag}, "
                 f"basis={alignment_info.get('basis_bps', Decimal('0')):.2f}bps/"
                 f"{alignment_info.get('threshold_bps', Decimal('0')):.2f}bps)"
             )
@@ -1839,8 +2216,27 @@ class HedgeBot:
             self.logger.error(f"❌ Failed to setup Lighter websocket: {e}")
             return
 
+        # Funding must be available before trading (fail fast)
+        if self.funding_enabled:
+            try:
+                self.refresh_funding_or_raise()
+            except Exception as e:
+                self.logger.error(f"❌ Funding startup check failed: {e}")
+                raise
+            self.funding_task = asyncio.create_task(self.funding_refresh_loop())
+            self.funding_ramp_task = asyncio.create_task(self.funding_ramp_loop())
+
         await asyncio.sleep(5)
         self.log_execution_control_config()
+
+        if self.strategy == "core_satellite":
+            self.netting_task = asyncio.create_task(self.run_netting_loop())
+            try:
+                await self.trading_loop_core_satellite()
+            finally:
+                if self.netting_task and not self.netting_task.done():
+                    self.netting_task.cancel()
+            return
 
         iterations = 0
         self.lighter_position = self.get_lighter_position()
@@ -1988,6 +2384,96 @@ class HedgeBot:
                 if exit_after_next_trade:
                     self.logger.info("Position back to zero. Done! Exiting...")
                     break
+
+    async def trading_loop_core_satellite(self):
+        """Core+Satellite: hold core hedge, generate volume with satellite maker fills, net hedge on Lighter."""
+        await self.refresh_positions()
+        core_bp_target, _core_lighter_target = self.get_core_targets()
+        self.logger.info(
+            f"[CORE] target_abs={self.core_target_abs_position} long_exchange={self.core_long_exchange} "
+            f"bp_target={core_bp_target}"
+        )
+
+        sat_direction = "buy"
+        last_core_rebalance = 0.0
+        iterations = 0
+        while iterations < self.iterations and not self.stop_flag:
+            iterations += 1
+            self.logger.info("-----------------------------------------------")
+            self.logger.info(f"🔄 Core+Satellite iteration {iterations}")
+            self.logger.info("-----------------------------------------------")
+
+            await self.refresh_positions()
+            if not await self.wait_for_market_data_health():
+                continue
+
+            # Flush if net exposure too large (netting window delay)
+            net_exposure = abs(self.backpack_position + self.lighter_position)
+            if net_exposure > self.satellite_max_net_exposure:
+                self.logger.warning(f"⚠️ Net exposure {net_exposure} exceeds satellite max {self.satellite_max_net_exposure}, forcing hedge flush")
+                await self.flush_netting_buffer(force=True, component="sat")
+                await asyncio.sleep(self.lighter_timeout_retry_sleep_seconds)
+                continue
+
+            # Optional low-frequency core rebalance towards target (best-effort)
+            if self.core_target_abs_position > 0 and (time.time() - last_core_rebalance) >= self.core_rebalance_interval_seconds:
+                last_core_rebalance = time.time()
+                await self.flush_netting_buffer(force=True, component="core")
+                await self.refresh_positions()
+                core_bp_target, _ = self.get_core_targets()
+                delta = core_bp_target - self.backpack_position
+                if abs(delta) >= self.order_quantity:
+                    side = "buy" if delta > 0 else "sell"
+                    qty = self.normalize_backpack_order_quantity(min(abs(delta), self.order_quantity), allow_skip=True)
+                    if qty > 0:
+                        self.logger.info(f"[CORE] rebalance via BP {side} {qty}, delta={delta}")
+                        prev_component = self.current_hedge_component
+                        self.current_hedge_component = "core"
+                        try:
+                            if not await self.wait_for_pre_trade_alignment(side):
+                                continue
+                            await self.place_backpack_post_only_order(side, qty)
+                            await self.flush_netting_buffer(force=True, component="core")
+                        finally:
+                            self.current_hedge_component = prev_component
+
+            if not self.satellite_enabled:
+                await asyncio.sleep(0.5)
+                continue
+
+            core_bp_target, _ = self.get_core_targets()
+            upper = core_bp_target + self.satellite_band
+            lower = core_bp_target - self.satellite_band
+            if self.backpack_position >= upper:
+                sat_direction = "sell"
+            elif self.backpack_position <= lower:
+                sat_direction = "buy"
+
+            side = sat_direction
+            if not await self.wait_for_pre_trade_alignment(side):
+                await asyncio.sleep(self.pre_trade_retry_sleep_seconds)
+                continue
+
+            if side == "buy":
+                remaining = max(Decimal("0"), upper - self.backpack_position)
+            else:
+                remaining = max(Decimal("0"), self.backpack_position - lower)
+
+            maker_qty = min(self.satellite_order_quantity, remaining)
+            maker_qty = self.get_state_adjusted_order_quantity(maker_qty)
+            if maker_qty <= 0:
+                await asyncio.sleep(0.2)
+                continue
+
+            prev_component = self.current_hedge_component
+            self.current_hedge_component = "sat"
+            try:
+                await self.place_backpack_post_only_order(side, maker_qty)
+            finally:
+                self.current_hedge_component = prev_component
+
+            await self.flush_netting_buffer(force=False, component="sat")
+            await asyncio.sleep(self.sleep_time + self.get_state_adjusted_sleep_seconds())
 
     async def run(self):
         """Run the hedge bot."""
