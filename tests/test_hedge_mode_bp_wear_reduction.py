@@ -297,3 +297,66 @@ def test_funding_direction_choice_prefers_higher_net_receive():
     # BP negative => longs receive; Lighter positive => shorts receive => choose BP long
     desired2 = bot.compute_desired_core_bp_target(Decimal("-0.0002"), Decimal("0.0001"))
     assert desired2 == Decimal("0.5")
+
+
+def test_funding_startup_check_retries_then_succeeds():
+    bot = _make_bot()
+    bot.funding_startup_retries = 3
+    bot.funding_startup_retry_sleep_seconds = 0.001
+    attempts = {"count": 0}
+
+    def _mock_refresh():
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise RuntimeError("funding temporary failure")
+
+    bot.refresh_funding_or_raise = _mock_refresh
+    result = asyncio.run(bot.funding_startup_check_with_retries())
+    assert result is True
+    assert attempts["count"] == 3
+
+
+def test_funding_startup_check_retries_then_fails():
+    bot = _make_bot()
+    bot.funding_startup_retries = 3
+    bot.funding_startup_retry_sleep_seconds = 0.001
+    attempts = {"count": 0}
+
+    def _mock_refresh():
+        attempts["count"] += 1
+        raise RuntimeError("funding failure")
+
+    bot.refresh_funding_or_raise = _mock_refresh
+    result = asyncio.run(bot.funding_startup_check_with_retries())
+    assert result is False
+    assert attempts["count"] == 3
+
+
+def test_satellite_trade_progress_requires_bounds_and_return_to_core():
+    bot = _make_bot()
+    bot.satellite_core_tolerance = Decimal("0.01")
+    bot.sat_touched_upper = False
+    bot.sat_touched_lower = False
+    core = Decimal("0.5")
+    lower = Decimal("0.2")
+    upper = Decimal("0.8")
+
+    assert bot.update_satellite_trade_progress(Decimal("0.8"), core, lower, upper) is False
+    assert bot.update_satellite_trade_progress(Decimal("0.2"), core, lower, upper) is False
+    assert bot.update_satellite_trade_progress(Decimal("0.5"), core, lower, upper) is True
+    assert bot.sat_touched_upper is False
+    assert bot.sat_touched_lower is False
+
+
+def test_satellite_trade_progress_not_counted_without_return_to_core():
+    bot = _make_bot()
+    bot.satellite_core_tolerance = Decimal("0.01")
+    bot.sat_touched_upper = False
+    bot.sat_touched_lower = False
+    core = Decimal("0.5")
+    lower = Decimal("0.2")
+    upper = Decimal("0.8")
+
+    assert bot.update_satellite_trade_progress(Decimal("0.8"), core, lower, upper) is False
+    assert bot.update_satellite_trade_progress(Decimal("0.2"), core, lower, upper) is False
+    assert bot.update_satellite_trade_progress(Decimal("0.45"), core, lower, upper) is False

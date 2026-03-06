@@ -141,10 +141,24 @@ class HedgeBot:
         self.funding_switch_threshold_seconds = float(self._safe_decimal_env("HEDGE_FUNDING_SWITCH_THRESHOLD_SEC", Decimal("3600")))
         self.funding_ramp_interval_seconds = float(self._safe_decimal_env("HEDGE_FUNDING_RAMP_INTERVAL_SEC", Decimal("60")))
         self.funding_ramp_step_quantity = self._safe_decimal_env("HEDGE_FUNDING_RAMP_STEP_QTY", self.order_quantity)
+        self.funding_startup_retries = max(1, self._safe_int_env("HEDGE_FUNDING_STARTUP_RETRIES", 3))
+        self.funding_startup_retry_sleep_seconds = float(
+            self._safe_decimal_env("HEDGE_FUNDING_STARTUP_RETRY_SLEEP_SEC", Decimal("2"))
+        )
+        self.funding_exit_unwind_max_rounds = max(1, self._safe_int_env("HEDGE_FUNDING_EXIT_UNWIND_MAX_ROUNDS", 100))
         self.netting_window_seconds = float(self._safe_decimal_env("HEDGE_NETTING_WINDOW_SEC", Decimal("1")))
         self.satellite_enabled = self._safe_bool_env("HEDGE_SAT_ENABLED", True)
         self.satellite_order_quantity = self._safe_decimal_env("HEDGE_SAT_ORDER_QTY", self.order_quantity)
         self.satellite_band = max(Decimal("0"), self._safe_decimal_env("HEDGE_SAT_BAND", self.max_position))
+        self.satellite_trades_per_iter = max(1, self._safe_int_env("HEDGE_SAT_TRADES_PER_ITER", 10))
+        self.satellite_core_tolerance = max(
+            Decimal("0.000001"),
+            self._safe_decimal_env("HEDGE_SAT_CORE_TOLERANCE", self.order_quantity),
+        )
+        self.exit_flatten_tolerance = max(
+            Decimal("0.000001"),
+            self._safe_decimal_env("HEDGE_EXIT_FLATTEN_TOLERANCE", Decimal("0.001")),
+        )
         self.satellite_max_net_exposure = self.order_quantity * max(Decimal('2'), self._safe_decimal_env("HEDGE_SAT_MAX_NET_EXPOSURE_MULT", Decimal("4")))
         self.core_target_abs_position = max(Decimal("0"), self._safe_decimal_env("HEDGE_CORE_TARGET_ABS_POSITION", Decimal("0")))
         self.core_long_exchange = (os.getenv("HEDGE_CORE_LONG_EXCHANGE", "backpack").strip().lower()
@@ -304,6 +318,8 @@ class HedgeBot:
         self.last_backpack_next_funding_ts = None
         self.last_lighter_next_funding_ts = None
         self.core_bp_target_live: Optional[Decimal] = None
+        self.sat_touched_upper = False
+        self.sat_touched_lower = False
 
         # Lighter API configuration
         self.lighter_base_url = "https://mainnet.zklighter.elliot.ai"
@@ -363,6 +379,9 @@ class HedgeBot:
             f"funding_enabled={self.funding_enabled}, "
             f"funding_refresh={self.funding_refresh_seconds}s, "
             f"funding_switch_threshold={self.funding_switch_threshold_seconds}s, "
+            f"funding_startup_retries={self.funding_startup_retries}, "
+            f"funding_startup_retry_sleep={self.funding_startup_retry_sleep_seconds}s, "
+            f"funding_exit_unwind_max_rounds={self.funding_exit_unwind_max_rounds}, "
             f"pre_trade_alignment={self.pre_trade_alignment_enabled}, "
             f"pre_trade_max_basis_bps={self.pre_trade_max_basis_bps}, "
             f"pre_trade_wait={self.pre_trade_wait_timeout_seconds}s, "
@@ -376,9 +395,12 @@ class HedgeBot:
             f"sat_enabled={self.satellite_enabled}, "
             f"sat_order_qty={self.satellite_order_quantity}, "
             f"sat_band={self.satellite_band}, "
+            f"sat_trades_per_iter={self.satellite_trades_per_iter}, "
+            f"sat_core_tolerance={self.satellite_core_tolerance}, "
             f"sat_max_net_exposure={self.satellite_max_net_exposure}, "
             f"core_abs_target={self.core_target_abs_position}, "
             f"core_long_exchange={self.core_long_exchange}, "
+            f"exit_flatten_tolerance={self.exit_flatten_tolerance}, "
             f"requote_drift_ticks={self.requote_price_drift_ticks}, "
             f"requote_min_age={self.requote_min_age_seconds}s, "
             f"requote_secondary_timeout={self.get_secondary_requote_timeout()}s, "
@@ -528,6 +550,183 @@ class HedgeBot:
             except Exception as e:
                 self.logger.error(f"❌ Funding refresh failed: {e}")
             await asyncio.sleep(max(60.0, self.funding_refresh_seconds))
+
+    async def funding_startup_check_with_retries(self) -> bool:
+        for attempt in range(1, self.funding_startup_retries + 1):
+            try:
+                self.logger.info(f"[FUNDING] Startup check attempt {attempt}/{self.funding_startup_retries}")
+                self.refresh_funding_or_raise()
+                self.logger.info("[FUNDING] Startup check succeeded")
+                return True
+            except Exception as e:
+                self.logger.error(f"❌ Funding startup check failed on attempt {attempt}: {e}")
+                if attempt < self.funding_startup_retries:
+                    await asyncio.sleep(max(0.2, self.funding_startup_retry_sleep_seconds))
+        return False
+
+    async def _flatten_residual_lighter_only(self, max_rounds: int) -> bool:
+        rounds = 0
+        while rounds < max_rounds and not self.stop_flag:
+            await self.refresh_positions()
+            if abs(self.lighter_position) <= self.order_quantity:
+                return True
+            rounds += 1
+            qty = min(abs(self.lighter_position), self.order_quantity)
+            side = "sell" if self.lighter_position > 0 else "buy"
+            reference = self.backpack_best_bid if side == "sell" else self.backpack_best_ask
+            if reference is None:
+                best_bid, best_ask = self.get_lighter_best_levels()
+                if best_bid and best_ask:
+                    reference = best_bid[0] if side == "sell" else best_ask[0]
+            if reference is None:
+                self.logger.error("❌ Unable to get reference price for residual lighter flatten")
+                return False
+            self.logger.warning(f"[EXIT-UNWIND] Flatten residual lighter via {side} {qty}, round={rounds}")
+            prev_component = self.current_hedge_component
+            self.current_hedge_component = "exit"
+            try:
+                result = await self.place_lighter_market_order(side, qty, reference)
+                if result is None:
+                    await asyncio.sleep(self.lighter_timeout_retry_sleep_seconds)
+                    return False
+            finally:
+                self.current_hedge_component = prev_component
+        await self.refresh_positions()
+        return abs(self.lighter_position) <= self.order_quantity
+
+    async def graceful_flatten_positions_before_exit(self) -> bool:
+        self.logger.warning("[EXIT-UNWIND] Funding unavailable, attempting graceful flatten before exit")
+        max_rounds = self.funding_exit_unwind_max_rounds
+        rounds = 0
+        while rounds < max_rounds and not self.stop_flag:
+            await self.refresh_positions()
+            bp_abs = abs(self.backpack_position)
+            lt_abs = abs(self.lighter_position)
+            if bp_abs <= self.order_quantity and lt_abs <= self.order_quantity:
+                self.logger.info(
+                    f"[EXIT-UNWIND] Flatten completed: backpack={self.backpack_position}, lighter={self.lighter_position}"
+                )
+                return True
+
+            rounds += 1
+            if bp_abs > self.order_quantity:
+                side = "sell" if self.backpack_position > 0 else "buy"
+                qty = self.normalize_backpack_order_quantity(min(bp_abs, self.order_quantity), allow_skip=True)
+                if qty <= 0:
+                    self.logger.warning("[EXIT-UNWIND] Backpack qty below min, switch to lighter residual flatten")
+                    return await self._flatten_residual_lighter_only(max_rounds - rounds)
+                self.logger.warning(
+                    f"[EXIT-UNWIND] Close backpack via {side} {qty}, backpack={self.backpack_position}, lighter={self.lighter_position}, round={rounds}"
+                )
+                prev_component = self.current_hedge_component
+                self.current_hedge_component = "exit"
+                try:
+                    await self.place_backpack_post_only_order(side, qty)
+                    if self.strategy == "core_satellite":
+                        await self.flush_netting_buffer(force=True, component="exit")
+                    elif self.waiting_for_lighter_fill:
+                        await self.process_pending_lighter_hedges()
+                finally:
+                    self.current_hedge_component = prev_component
+            else:
+                ok = await self._flatten_residual_lighter_only(max_rounds - rounds)
+                if not ok:
+                    break
+            await asyncio.sleep(self.lighter_timeout_retry_sleep_seconds)
+
+        await self.refresh_positions()
+        self.logger.error(
+            f"❌ [EXIT-UNWIND] Unable to fully flatten within limit: backpack={self.backpack_position}, lighter={self.lighter_position}"
+        )
+        return False
+
+    def update_satellite_trade_progress(
+        self,
+        backpack_position: Decimal,
+        core_bp_target: Decimal,
+        lower_bound: Decimal,
+        upper_bound: Decimal,
+    ) -> bool:
+        """Count one satellite trade when both bounds were visited and position returns near core target."""
+        if backpack_position >= upper_bound - self.satellite_core_tolerance:
+            self.sat_touched_upper = True
+        if backpack_position <= lower_bound + self.satellite_core_tolerance:
+            self.sat_touched_lower = True
+        if self.sat_touched_upper and self.sat_touched_lower:
+            if abs(backpack_position - core_bp_target) <= self.satellite_core_tolerance:
+                self.sat_touched_upper = False
+                self.sat_touched_lower = False
+                return True
+        return False
+
+    async def flatten_all_positions_on_completion(self) -> bool:
+        """Best-effort full flatten on normal completion: both exchanges to near-zero."""
+        self.logger.info("[EXIT-FLAT] Iterations completed, flattening all positions to zero")
+        max_rounds = self.funding_exit_unwind_max_rounds
+        rounds = 0
+        while rounds < max_rounds and not self.stop_flag:
+            await self.refresh_positions()
+            bp_abs = abs(self.backpack_position)
+            lt_abs = abs(self.lighter_position)
+            if bp_abs <= self.exit_flatten_tolerance and lt_abs <= self.exit_flatten_tolerance:
+                self.logger.info(
+                    f"[EXIT-FLAT] Completed: backpack={self.backpack_position}, lighter={self.lighter_position}"
+                )
+                return True
+
+            rounds += 1
+            if bp_abs > self.exit_flatten_tolerance:
+                side = "sell" if self.backpack_position > 0 else "buy"
+                qty = self.normalize_backpack_order_quantity(min(bp_abs, self.order_quantity), allow_skip=True)
+                if qty > 0:
+                    self.logger.info(
+                        f"[EXIT-FLAT] Backpack close round={rounds} side={side} qty={qty} "
+                        f"bp={self.backpack_position} lt={self.lighter_position}"
+                    )
+                    prev_component = self.current_hedge_component
+                    self.current_hedge_component = "exit"
+                    try:
+                        await self.place_backpack_post_only_order(side, qty)
+                        if self.strategy == "core_satellite":
+                            await self.flush_netting_buffer(force=True, component="exit")
+                        elif self.waiting_for_lighter_fill:
+                            await self.process_pending_lighter_hedges()
+                    finally:
+                        self.current_hedge_component = prev_component
+                    await asyncio.sleep(self.lighter_timeout_retry_sleep_seconds)
+                    continue
+
+            if lt_abs > self.exit_flatten_tolerance:
+                side = "sell" if self.lighter_position > 0 else "buy"
+                qty = min(lt_abs, self.order_quantity)
+                reference_price = self.backpack_best_bid if side == "sell" else self.backpack_best_ask
+                if reference_price is None:
+                    best_bid, best_ask = self.get_lighter_best_levels()
+                    if best_bid and best_ask:
+                        reference_price = best_bid[0] if side == "sell" else best_ask[0]
+                if reference_price is None:
+                    self.logger.error("[EXIT-FLAT] Missing reference price, abort flatten")
+                    return False
+                self.logger.info(
+                    f"[EXIT-FLAT] Lighter close round={rounds} side={side} qty={qty} "
+                    f"bp={self.backpack_position} lt={self.lighter_position}"
+                )
+                prev_component = self.current_hedge_component
+                self.current_hedge_component = "exit"
+                try:
+                    result = await self.place_lighter_market_order(side, qty, reference_price)
+                    if result is None:
+                        await asyncio.sleep(self.lighter_timeout_retry_sleep_seconds)
+                        continue
+                finally:
+                    self.current_hedge_component = prev_component
+            await asyncio.sleep(self.lighter_timeout_retry_sleep_seconds)
+
+        await self.refresh_positions()
+        self.logger.error(
+            f"[EXIT-FLAT] Failed within limit: backpack={self.backpack_position}, lighter={self.lighter_position}"
+        )
+        return False
 
     async def funding_ramp_loop(self):
         while not self.stop_flag:
@@ -2218,11 +2417,11 @@ class HedgeBot:
 
         # Funding must be available before trading (fail fast)
         if self.funding_enabled:
-            try:
-                self.refresh_funding_or_raise()
-            except Exception as e:
-                self.logger.error(f"❌ Funding startup check failed: {e}")
-                raise
+            funding_ok = await self.funding_startup_check_with_retries()
+            if not funding_ok:
+                self.logger.error("❌ Funding startup check exhausted retries")
+                await self.graceful_flatten_positions_before_exit()
+                raise RuntimeError("Funding unavailable after retries, exited with unwind attempt")
             self.funding_task = asyncio.create_task(self.funding_refresh_loop())
             self.funding_ramp_task = asyncio.create_task(self.funding_ramp_loop())
 
@@ -2396,11 +2595,16 @@ class HedgeBot:
 
         sat_direction = "buy"
         last_core_rebalance = 0.0
-        iterations = 0
-        while iterations < self.iterations and not self.stop_flag:
-            iterations += 1
+        completed_iters = 0
+        trades_in_current_iter = 0
+        self.sat_touched_upper = False
+        self.sat_touched_lower = False
+        while completed_iters < self.iterations and not self.stop_flag:
             self.logger.info("-----------------------------------------------")
-            self.logger.info(f"🔄 Core+Satellite iteration {iterations}")
+            self.logger.info(
+                f"🔄 Core+Satellite iteration {completed_iters + 1}/{self.iterations} "
+                f"(trade progress {trades_in_current_iter}/{self.satellite_trades_per_iter})"
+            )
             self.logger.info("-----------------------------------------------")
 
             await self.refresh_positions()
@@ -2444,6 +2648,20 @@ class HedgeBot:
             core_bp_target, _ = self.get_core_targets()
             upper = core_bp_target + self.satellite_band
             lower = core_bp_target - self.satellite_band
+
+            if self.update_satellite_trade_progress(self.backpack_position, core_bp_target, lower, upper):
+                trades_in_current_iter += 1
+                self.logger.info(
+                    f"[SAT] completed trade {trades_in_current_iter}/{self.satellite_trades_per_iter} "
+                    f"for iteration {completed_iters + 1}/{self.iterations}"
+                )
+                if trades_in_current_iter >= self.satellite_trades_per_iter:
+                    completed_iters += 1
+                    trades_in_current_iter = 0
+                    self.logger.info(f"[SAT] iteration completed: {completed_iters}/{self.iterations}")
+                    if completed_iters >= self.iterations:
+                        break
+
             if self.backpack_position >= upper:
                 sat_direction = "sell"
             elif self.backpack_position <= lower:
@@ -2474,6 +2692,10 @@ class HedgeBot:
 
             await self.flush_netting_buffer(force=False, component="sat")
             await asyncio.sleep(self.sleep_time + self.get_state_adjusted_sleep_seconds())
+
+        if not self.stop_flag:
+            await self.flush_netting_buffer(force=True, component="exit")
+            await self.flatten_all_positions_on_completion()
 
     async def run(self):
         """Run the hedge bot."""
