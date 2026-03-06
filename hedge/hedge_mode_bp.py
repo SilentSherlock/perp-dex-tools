@@ -101,6 +101,7 @@ class HedgeBot:
         self.wide_basis_bps = max(self.max_basis_bps, self._safe_decimal_env('HEDGE_WIDE_BASIS_BPS', Decimal('25')))
         self.lighter_fill_timeout_seconds = float(self._safe_decimal_env('HEDGE_LIGHTER_FILL_TIMEOUT_SEC', Decimal('30')))
         self.lighter_timeout_retry_sleep_seconds = float(self._safe_decimal_env('HEDGE_LIGHTER_TIMEOUT_RETRY_SLEEP_SEC', Decimal('2')))
+        self.lighter_cancel_after_seconds = float(self._safe_decimal_env('HEDGE_LIGHTER_CANCEL_AFTER_SEC', Decimal('300')))
         self.absolute_exposure_limit = self.order_quantity * max(Decimal('100'), self._safe_decimal_env('HEDGE_ABSOLUTE_EXPOSURE_MULTIPLIER', Decimal('100')))
         self.state_changed_at = time.time()
         self.risk_state = RiskState.NORMAL
@@ -273,6 +274,7 @@ class HedgeBot:
             f"hedge_align_max={self.hedge_alignment_max_bps}bps, "
             f"hedge_align_wait={self.hedge_alignment_wait_timeout_seconds}s, "
             f"hedge_force_on_timeout={self.hedge_alignment_force_on_timeout}, "
+            f"lighter_cancel_after={self.lighter_cancel_after_seconds}s, "
             f"requote_drift_ticks={self.requote_price_drift_ticks}, "
             f"requote_min_age={self.requote_min_age_seconds}s, "
             f"requote_secondary_timeout={self.get_secondary_requote_timeout()}s, "
@@ -1386,10 +1388,36 @@ class HedgeBot:
         self.pending_lighter_hedges.append(self.lighter_order_info.copy())
         self.waiting_for_lighter_fill = True
 
+    async def cancel_lighter_order(self, client_order_index: int) -> bool:
+        """Cancel active Lighter order by client order index."""
+        try:
+            if not self.lighter_client:
+                return False
+            _cancel_tx, tx_hash, error = await self.lighter_client.cancel_order(
+                market_index=self.lighter_market_index,
+                order_index=int(client_order_index),
+            )
+            if error is not None:
+                self.logger.error(f"❌ Failed to cancel Lighter order {client_order_index}: {error}")
+                return False
+            if not tx_hash:
+                self.logger.error(f"❌ Failed to cancel Lighter order {client_order_index}: empty tx hash")
+                return False
+            self.logger.warning(f"⚠️ Lighter order cancel requested after long wait: order_id={client_order_index}")
+            return True
+        except Exception as e:
+            self.logger.error(f"❌ Exception canceling Lighter order {client_order_index}: {e}")
+            return False
+
 
     async def place_lighter_market_order(self, lighter_side: str, quantity: Decimal, price: Decimal):
         if not self.lighter_client:
             await self.initialize_lighter_client()
+        if self.active_lighter_client_order_id:
+            self.logger.warning(
+                f"⚠️ Skip placing new Lighter hedge, active order still tracked: {self.active_lighter_client_order_id}"
+            )
+            return None
         reference_price = price
 
         best_bid, best_ask = self.get_lighter_best_levels()
@@ -1488,12 +1516,32 @@ class HedgeBot:
         """Monitor Lighter order and adjust price if needed."""
 
         start_time = time.time()
+        overall_start_time = start_time
         timeout_round = 0
+        cancel_requested = False
         while not self.lighter_order_filled and not self.stop_flag:
             if self.lighter_order_failed:
                 reason = self.lighter_order_failure_reason or "order_terminal"
                 self.logger.warning(f"⚠️ Lighter order monitor ended: order_id={client_order_index}, reason={reason}")
                 return False
+            if (not cancel_requested) and self.lighter_cancel_after_seconds > 0:
+                total_wait = time.time() - overall_start_time
+                if total_wait >= self.lighter_cancel_after_seconds:
+                    cancel_requested = True
+                    cancel_ok = await self.cancel_lighter_order(client_order_index)
+                    if cancel_ok:
+                        self.lighter_order_filled = False
+                        self.lighter_order_failed = True
+                        self.lighter_order_failure_reason = "cancel_after_timeout"
+                        self.active_lighter_client_order_id = None
+                        self.lighter_order_contexts.pop(str(client_order_index), None)
+                        self.logger.warning(
+                            f"⚠️ Lighter order canceled after timeout window: order_id={client_order_index}, wait={total_wait:.1f}s"
+                        )
+                        return False
+                    self.logger.warning(
+                        f"⚠️ Cancel request failed for stuck Lighter order: order_id={client_order_index}, continue waiting..."
+                    )
             # Check timeout window and continue waiting with retry logging
             if time.time() - start_time > self.lighter_fill_timeout_seconds:
                 timeout_round += 1
